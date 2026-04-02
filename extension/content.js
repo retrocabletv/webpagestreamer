@@ -5,6 +5,16 @@
   let recorder = null;
   let ws = null;
 
+  // Hide scrollbars — the captured page should fill the viewport cleanly.
+  function hideScrollbars() {
+    const style = document.createElement("style");
+    style.textContent = `
+      html, body { overflow: hidden !important; }
+      ::-webkit-scrollbar { display: none !important; }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
   // Force Chrome to keep rendering frames even on static pages
   // by continuously animating a tiny invisible element.
   function forceFrames() {
@@ -138,6 +148,7 @@
         width + "x" + height,
         "@" + framerate + "fps"
       );
+      hideScrollbars();
       forceFrames();
       startCapture(port, width, height, framerate);
     }
