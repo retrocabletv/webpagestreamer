@@ -44,18 +44,33 @@ if [ -z "$WS_URL" ]; then
 fi
 
 echo "[trigger] found tab: $WS_URL"
-echo "[trigger] sending capture command..."
+echo "[trigger] setting viewport to ${WIDTH}x${HEIGHT}..."
 
-# Use websocat or python to send CDP command
+# Use CDP to set exact viewport size, then trigger capture
 python3 <<PYEOF
 import json, asyncio, websockets
 
 async def trigger():
     ws_url = "${WS_URL}"
     async with websockets.connect(ws_url, max_size=None) as ws:
+        # Set exact viewport dimensions via device metrics override
+        metrics_cmd = {
+            "id": 1,
+            "method": "Emulation.setDeviceMetricsOverride",
+            "params": {
+                "width": ${WIDTH},
+                "height": ${HEIGHT},
+                "deviceScaleFactor": 1,
+                "mobile": False
+            }
+        }
+        await ws.send(json.dumps(metrics_cmd))
+        resp = await ws.recv()
+        print("[trigger] viewport set:", resp)
+
         # Send JavaScript evaluation to trigger capture
         cmd = {
-            "id": 1,
+            "id": 2,
             "method": "Runtime.evaluate",
             "params": {
                 "expression": """
