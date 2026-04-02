@@ -36,6 +36,18 @@ docker run --rm \
   webpagestreamer
 ```
 
+### Test script
+
+The easiest way to verify everything works:
+
+```bash
+./test.sh                           # Builds, runs with TCP output, shows connection info
+URL="https://example.com" ./test.sh # Custom URL
+DURATION=60 ./test.sh               # Run for 60s instead of default 30s
+```
+
+Then connect from another terminal with `ffplay tcp://127.0.0.1:5000` or VLC.
+
 ### Using docker-compose
 
 ```bash
@@ -93,8 +105,9 @@ docker run --rm -p 5000:5000 \
 ## Project structure
 
 ```
-├── Dockerfile              # Container image definition
+├── Dockerfile              # Alpine-based container image
 ├── docker-compose.yml      # Compose file for easy local usage
+├── test.sh                 # Quick test: builds and streams over TCP
 ├── start.sh                # Entrypoint: configures and launches supervisord
 ├── supervisord.conf        # Process manager for relay, Chrome, and trigger
 ├── trigger-capture.sh      # Uses CDP to tell the extension to start capturing

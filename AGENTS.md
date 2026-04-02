@@ -22,7 +22,7 @@ Chrome tab → content.js (MediaRecorder, WebM) → WebSocket → relay/server.j
 
 ## Key files
 
-- `Dockerfile` — Single-stage Debian bookworm-slim image. Installs Chromium, FFmpeg, Node.js 20, supervisor, Python3 + websockets.
+- `Dockerfile` — Single-stage Alpine 3.21 image. Installs Chromium, FFmpeg, Node.js, supervisor, Python3 + websockets.
 - `start.sh` — Entrypoint. Sets defaults, generates the Chrome launch script, exports env vars, starts supervisord.
 - `supervisord.conf` — Manages relay, chrome, and trigger processes. Relay and Chrome auto-restart; trigger retries on unexpected exit.
 - `trigger-capture.sh` — Bash + inline Python. Polls CDP `/json` endpoint, finds the page tab's WebSocket debugger URL, sends `Runtime.evaluate` to start capture.

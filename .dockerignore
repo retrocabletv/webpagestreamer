@@ -2,4 +2,6 @@
 node_modules
 README.md
 AGENTS.md
+LICENSE
 docker-compose.yml
+test.sh
