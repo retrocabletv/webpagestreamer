@@ -9,6 +9,6 @@ services:
       - FRAMERATE=25
     # Uncomment for TCP output and expose the port:
     # ports:
-    #   - "5000:5000"
+    #   - "9876:9876"
     # Uncomment for host networking (needed for UDP multicast in some setups):
     # network_mode: host

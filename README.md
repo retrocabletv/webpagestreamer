@@ -46,7 +46,7 @@ URL="https://example.com" ./test.sh # Custom URL
 DURATION=60 ./test.sh               # Run for 60s instead of default 30s
 ```
 
-Then connect from another terminal with `ffplay tcp://127.0.0.1:5000` or VLC.
+Then connect from another terminal with `ffplay -f mpegts tcp://127.0.0.1:9876` or VLC.
 
 ### Using docker-compose
 
@@ -69,29 +69,32 @@ docker compose up --build
 
 ## Output examples
 
-The `OUTPUT` variable accepts any valid FFmpeg output string:
+The `OUTPUT` variable supports UDP, TCP, and file destinations:
 
 ```bash
 # UDP multicast
 -e OUTPUT="udp://239.0.0.1:1234?pkt_size=1316"
 
 # UDP unicast
--e OUTPUT="udp://192.168.1.100:5000?pkt_size=1316"
+-e OUTPUT="udp://192.168.1.100:5000"
 
-# TCP listener (FFmpeg listens, clients connect)
--e OUTPUT="tcp://0.0.0.0:5000?listen=1"
+# TCP server (container listens, clients connect)
+-e OUTPUT="tcp://0.0.0.0:9876"
 
 # Write to file (useful for testing)
 -e OUTPUT="/tmp/output.ts"
 ```
 
-For TCP output, remember to expose the port:
+For TCP output, expose the port and connect with any MPEG-TS player. Multiple clients can connect simultaneously:
 
 ```bash
-docker run --rm -p 5000:5000 \
+docker run --rm -p 9876:9876 \
   -e URL="https://example.com" \
-  -e OUTPUT="tcp://0.0.0.0:5000?listen=1" \
+  -e OUTPUT="tcp://0.0.0.0:9876" \
   webpagestreamer
+
+# Then connect:
+ffplay -f mpegts tcp://127.0.0.1:9876
 ```
 
 ## FFmpeg encoding settings

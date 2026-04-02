@@ -17,7 +17,7 @@ Three processes run inside the container, managed by supervisord:
 ## Data flow
 
 ```
-Chrome tab → content.js (MediaRecorder, WebM) → WebSocket → relay/server.js → FFmpeg stdin → MPEG-TS output
+Chrome tab → content.js (MediaRecorder, WebM) → WebSocket → relay/server.js → FFmpeg stdin → FFmpeg stdout (MPEG-TS) → relay output handler → UDP/TCP/file
 ```
 
 ## Key files
@@ -26,7 +26,7 @@ Chrome tab → content.js (MediaRecorder, WebM) → WebSocket → relay/server.j
 - `start.sh` — Entrypoint. Sets defaults, generates the Chrome launch script, exports env vars, starts supervisord.
 - `supervisord.conf` — Manages relay, chrome, and trigger processes. Relay and Chrome auto-restart; trigger retries on unexpected exit.
 - `trigger-capture.sh` — Bash + inline Python. Polls CDP `/json` endpoint, finds the page tab's WebSocket debugger URL, sends `Runtime.evaluate` to start capture.
-- `relay/server.js` — Spawns FFmpeg, creates WebSocket server. Binary messages from the extension are written to FFmpeg's stdin. FFmpeg auto-restarts on exit.
+- `relay/server.js` — Spawns FFmpeg (outputs MPEG-TS to stdout), creates WebSocket server. Binary WebM messages from the extension are written to FFmpeg's stdin. FFmpeg stdout is forwarded to the configured output destination (UDP, TCP server, or file) via the relay's output handler. FFmpeg auto-restarts on exit.
 - `extension/manifest.json` — Manifest V3. Permissions: tabs, tabCapture, activeTab, scripting. Has a hardcoded `key` field that determines the extension ID.
 - `extension/background.js` — Service worker. Responds to `get-stream-id` messages by calling `chrome.tabCapture.getMediaStreamId()`.
 - `extension/content.js` — Injected on all pages. Listens for `CAPTURE_COMMAND` window message, gets stream ID from background, calls `getUserMedia` with tab capture constraints, creates MediaRecorder (20ms timeslice), sends WebM chunks over WebSocket.
