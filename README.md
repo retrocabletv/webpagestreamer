@@ -16,24 +16,28 @@ Chromium (headless, with capture extension)
                           │
                           └── FFmpeg (H.264 + AAC ──► MPEG-TS)
                                   │
-                                  └── UDP / TCP output
+                                  └── UDP / TCP / file output
 ```
 
 1. **Chromium** launches headless with a built-in extension that captures the active tab's audio and video using `chrome.tabCapture`
 2. The **content script** records the media stream as WebM and sends chunks over WebSocket to a local relay server
-3. The **relay server** (Node.js) pipes the WebM data into **FFmpeg**, which transcodes to H.264/AAC and outputs MPEG-TS
-4. **Supervisord** manages all processes (relay, Chrome, capture trigger) and restarts them on failure
+3. The **relay server** (Node.js) pipes the WebM data into **FFmpeg**, which transcodes to H.264/AAC MPEG-TS on stdout
+4. The relay's **output handler** forwards the MPEG-TS to the configured destination (UDP, TCP server, or file)
+5. **Supervisord** manages all processes (relay, Chrome, capture trigger) and restarts them on failure
 
 ## Quick start
 
 ```bash
 docker build -t webpagestreamer .
 
-# Stream a webpage to UDP multicast
-docker run --rm \
+# Stream a webpage over TCP (easiest way to verify it works)
+docker run --rm -p 9876:9876 \
   -e URL="https://example.com" \
-  -e OUTPUT="udp://239.0.0.1:1234?pkt_size=1316" \
+  -e OUTPUT="tcp://0.0.0.0:9876" \
   webpagestreamer
+
+# Then in another terminal:
+ffplay -f mpegts tcp://127.0.0.1:9876
 ```
 
 ### Test script
@@ -60,32 +64,20 @@ docker compose up --build
 | Variable    | Default                                    | Description                              |
 |-------------|--------------------------------------------|------------------------------------------|
 | `URL`       | `https://www.google.com`                   | Web page to capture                      |
-| `OUTPUT`    | `udp://239.0.0.1:1234?pkt_size=1316`      | FFmpeg output destination                |
+| `OUTPUT`    | `udp://239.0.0.1:1234`                    | Output destination (UDP, TCP, or file)   |
 | `WIDTH`     | `720`                                      | Capture width in pixels                  |
 | `HEIGHT`    | `576`                                      | Capture height in pixels (PAL: 576)      |
 | `FRAMERATE` | `25`                                       | Frames per second (PAL: 25)              |
 | `WS_PORT`   | `9000`                                     | Internal WebSocket relay port            |
 | `CDP_PORT`  | `9222`                                     | Chrome DevTools Protocol port            |
 
-## Output examples
+## Output destinations
 
-The `OUTPUT` variable supports UDP, TCP, and file destinations:
+The `OUTPUT` variable supports three transport types:
 
-```bash
-# UDP multicast
--e OUTPUT="udp://239.0.0.1:1234?pkt_size=1316"
+### TCP (recommended for local testing)
 
-# UDP unicast
--e OUTPUT="udp://192.168.1.100:5000"
-
-# TCP server (container listens, clients connect)
--e OUTPUT="tcp://0.0.0.0:9876"
-
-# Write to file (useful for testing)
--e OUTPUT="/tmp/output.ts"
-```
-
-For TCP output, expose the port and connect with any MPEG-TS player. Multiple clients can connect simultaneously:
+The container runs a TCP server. Multiple clients can connect simultaneously. No timing or routing issues.
 
 ```bash
 docker run --rm -p 9876:9876 \
@@ -93,8 +85,44 @@ docker run --rm -p 9876:9876 \
   -e OUTPUT="tcp://0.0.0.0:9876" \
   webpagestreamer
 
-# Then connect:
+# Connect with any MPEG-TS player:
 ffplay -f mpegts tcp://127.0.0.1:9876
+vlc tcp://127.0.0.1:9876
+ffmpeg -f mpegts -i tcp://127.0.0.1:9876 -t 10 -c copy clip.ts
+```
+
+### UDP unicast / multicast
+
+Best for production use where you need to feed an IPTV headend, hardware decoder, or network receiver.
+
+```bash
+# Unicast to a specific host
+docker run --rm \
+  -e URL="https://example.com" \
+  -e OUTPUT="udp://192.168.1.100:1234" \
+  webpagestreamer
+
+# Multicast (requires --network host on Linux; does NOT work on macOS Docker)
+docker run --rm --network host \
+  -e URL="https://example.com" \
+  -e OUTPUT="udp://239.0.0.1:1234" \
+  webpagestreamer
+```
+
+> **Note:** UDP multicast does not work from Docker on macOS because Docker Desktop runs inside a Linux VM that doesn't route multicast to the host. Use TCP for local testing on Mac, or `--network host` on a Linux host.
+
+### File
+
+Useful for debugging or recording.
+
+```bash
+docker run --rm -v /tmp:/output \
+  -e URL="https://example.com" \
+  -e OUTPUT="/output/stream.ts" \
+  webpagestreamer
+
+# Let it run, then play:
+ffplay /tmp/stream.ts
 ```
 
 ## FFmpeg encoding settings
@@ -115,7 +143,7 @@ ffplay -f mpegts tcp://127.0.0.1:9876
 ├── supervisord.conf        # Process manager for relay, Chrome, and trigger
 ├── trigger-capture.sh      # Uses CDP to tell the extension to start capturing
 ├── relay/
-│   ├── server.js           # WebSocket server that pipes data to FFmpeg
+│   ├── server.js           # WebSocket → FFmpeg → output transport
 │   └── package.json
 └── extension/
     ├── manifest.json        # Chrome extension manifest (Manifest V3)
@@ -126,18 +154,25 @@ ffplay -f mpegts tcp://127.0.0.1:9876
 ## Troubleshooting
 
 **Container starts but no output stream**
-- Check logs with `docker logs <container>` — look for `[trigger]` and `[capture]` messages
+- Check logs with `docker logs <container>` — look for `[trigger]`, `[capture]`, and `[relay]` messages
 - The trigger script waits up to 60 seconds for Chrome CDP, then retries on failure
-- Ensure the output destination is reachable from inside the container
+- For TCP, verify you can connect to the port: `nc -z 127.0.0.1 9876`
 
 **High latency**
 - The MediaRecorder uses a 20ms timeslice for low latency
 - FFmpeg uses `ultrafast` preset and `zerolatency` tune
 - Network conditions between the container and receiver affect end-to-end latency
 
-**Multicast not working**
-- Docker's default bridge network may not route multicast — use `--network host` if needed
-- Check that your network infrastructure supports multicast
+**UDP multicast not working**
+- Does not work on macOS Docker — use TCP for local testing
+- On Linux, use `--network host` to allow multicast routing
+- Check that your network infrastructure supports multicast (IGMP snooping, etc.)
+
+**Accessing a local dev server from the container**
+- Use `host.docker.internal` instead of `localhost`:
+  ```bash
+  -e URL="http://host.docker.internal:3000"
+  ```
 
 ## License
 

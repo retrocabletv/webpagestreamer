@@ -29,7 +29,7 @@ RUN chmod +x /app/start.sh /app/trigger-capture.sh
 
 # Environment defaults
 ENV URL="https://www.google.com" \
-    OUTPUT="udp://239.0.0.1:1234?pkt_size=1316" \
+    OUTPUT="udp://239.0.0.1:1234" \
     WIDTH="720" \
     HEIGHT="576" \
     FRAMERATE="25" \

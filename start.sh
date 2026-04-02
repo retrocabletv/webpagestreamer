@@ -7,7 +7,7 @@ URL="${URL:-https://www.google.com}"
 WIDTH="${WIDTH:-720}"
 HEIGHT="${HEIGHT:-576}"
 FRAMERATE="${FRAMERATE:-25}"
-OUTPUT="${OUTPUT:-udp://239.0.0.1:1234?pkt_size=1316}"
+OUTPUT="${OUTPUT:-udp://239.0.0.1:1234}"
 WS_PORT="${WS_PORT:-9000}"
 CDP_PORT="${CDP_PORT:-9222}"
 
