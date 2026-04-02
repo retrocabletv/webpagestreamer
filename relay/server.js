@@ -87,8 +87,10 @@ function startFFmpeg() {
 }
 
 function startWebSocketServer() {
-  const wss = new WebSocketServer({ port: WS_PORT });
-  console.log(`[relay] WebSocket server listening on port ${WS_PORT}`);
+  const wss = new WebSocketServer({ port: WS_PORT }, () => {
+    console.log(`[relay] WebSocket server listening on port ${WS_PORT}`);
+    console.log(`[relay] relay server ready — output: ${OUTPUT}`);
+  });
 
   wss.on("connection", (socket) => {
     console.log("[relay] extension connected");
@@ -112,5 +114,3 @@ function startWebSocketServer() {
 // Start both components
 startFFmpeg();
 startWebSocketServer();
-
-console.log(`[relay] relay server ready — output: ${OUTPUT}`);
