@@ -30,9 +30,7 @@ RUN chmod +x /app/start.sh /app/trigger-capture.sh
 # Environment defaults
 ENV URL="https://www.google.com" \
     OUTPUT="udp://239.0.0.1:1234" \
-    WIDTH="720" \
-    HEIGHT="576" \
-    FRAMERATE="25" \
+    PROFILE="pal" \
     WS_PORT="9000" \
     CDP_PORT="9222" \
     CHANNEL_NAME="WebPageStreamer" \

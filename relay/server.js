@@ -17,14 +17,72 @@ const url = require("url");
 
 const WS_PORT = parseInt(process.env.WS_PORT || "9000", 10);
 const OUTPUT = process.env.OUTPUT || "udp://239.0.0.1:1234?pkt_size=1316";
-const WIDTH = process.env.WIDTH || "720";
-const HEIGHT = process.env.HEIGHT || "576";
-const FRAMERATE = process.env.FRAMERATE || "25";
+const PROFILE = process.env.PROFILE || "pal";
 const CHANNEL_NAME = process.env.CHANNEL_NAME || "WebPageStreamer";
 const CHANNEL_ID = process.env.CHANNEL_ID || "webpagestreamer.1";
 const PROGRAMME_TITLE = process.env.PROGRAMME_TITLE || "Live Stream";
 const PROGRAMME_DESC = process.env.PROGRAMME_DESC || "";
 const STREAM_URL = process.env.STREAM_URL || "";
+
+// ---------------------------------------------------------------------------
+// Encoding profiles — each bundles resolution, codec, and format defaults
+// ---------------------------------------------------------------------------
+
+const PROFILES = {
+  pal: {
+    width: 720, height: 576, framerate: 25,
+    videoCodec: "mpeg2video", audioCodec: "mp2",
+    videoBitrate: "5000k", audioBitrate: "256k",
+    sar: "12/11", interlaced: true, format: "mpegts",
+  },
+  ntsc: {
+    width: 720, height: 480, framerate: 29.97,
+    videoCodec: "mpeg2video", audioCodec: "mp2",
+    videoBitrate: "5000k", audioBitrate: "256k",
+    sar: "10/11", interlaced: true, format: "mpegts",
+  },
+  "720p": {
+    width: 1280, height: 720, framerate: 30,
+    videoCodec: "libx264", audioCodec: "aac",
+    videoBitrate: "2500k", audioBitrate: "128k",
+    sar: "1/1", interlaced: false, format: "mpegts",
+  },
+  "1080p": {
+    width: 1920, height: 1080, framerate: 30,
+    videoCodec: "libx264", audioCodec: "aac",
+    videoBitrate: "5000k", audioBitrate: "128k",
+    sar: "1/1", interlaced: false, format: "mpegts",
+  },
+  hls: {
+    width: 1280, height: 720, framerate: 30,
+    videoCodec: "libx264", audioCodec: "aac",
+    videoBitrate: "2500k", audioBitrate: "128k",
+    sar: "1/1", interlaced: false, format: "hls",
+  },
+};
+
+const baseProfile = PROFILES[PROFILE] || PROFILES.pal;
+if (!PROFILES[PROFILE]) {
+  console.warn(`[relay] Unknown profile "${PROFILE}", falling back to "pal"`);
+}
+
+// Environment overrides take precedence over profile defaults
+const WIDTH = process.env.WIDTH || String(baseProfile.width);
+const HEIGHT = process.env.HEIGHT || String(baseProfile.height);
+const FRAMERATE = process.env.FRAMERATE || String(baseProfile.framerate);
+const VIDEO_CODEC = process.env.VIDEO_CODEC || baseProfile.videoCodec;
+const AUDIO_CODEC = process.env.AUDIO_CODEC || baseProfile.audioCodec;
+const VIDEO_BITRATE = process.env.VIDEO_BITRATE || baseProfile.videoBitrate;
+const AUDIO_BITRATE = process.env.AUDIO_BITRATE || baseProfile.audioBitrate;
+const SAR = process.env.SAR || baseProfile.sar;
+const INTERLACED = process.env.INTERLACED
+  ? process.env.INTERLACED === "true"
+  : baseProfile.interlaced;
+const FORMAT = process.env.FORMAT || baseProfile.format;
+
+const HLS_DIR = "/tmp/hls";
+const HLS_SEGMENT_TIME = process.env.HLS_SEGMENT_TIME || "2";
+const HLS_LIST_SIZE = process.env.HLS_LIST_SIZE || "5";
 
 let ffmpeg = null;
 let ffmpegReady = false;
@@ -137,44 +195,85 @@ function createOutputHandler(outputStr) {
 // FFmpeg — encodes WebM to MPEG-TS, outputs on stdout
 // ---------------------------------------------------------------------------
 
-function startFFmpeg() {
+function buildFFmpegArgs() {
+  const gop = String(Math.round(parseFloat(FRAMERATE) / 2));
   const args = [
     // Input: WebM from stdin
     "-i", "pipe:0",
-    // Video: MPEG-2 (standard for PAL DVB/analogue)
-    "-c:v", "mpeg2video",
+    // Video
+    "-c:v", VIDEO_CODEC,
     "-s", `${WIDTH}x${HEIGHT}`,
     "-r", FRAMERATE,
-    "-b:v", "5000k",
-    "-maxrate", "5000k",
+    "-b:v", VIDEO_BITRATE,
+    "-maxrate", VIDEO_BITRATE,
     "-bufsize", "2000k",
     "-pix_fmt", "yuv420p",
-    "-g", String(parseInt(FRAMERATE, 10) / 2), // GOP = 0.5 seconds (fast channel join)
+    "-g", gop,
     "-bf", "2",
-    "-flags", "+ilme+ildct",
-    "-vf", "setsar=12/11", // PAL 4:3 SAR (ITU BT.601)
-    // Audio: MPEG-2 layer 2 (standard for PAL broadcast)
-    "-c:a", "mp2",
-    "-b:a", "256k",
-    "-ar", "48000",
-    "-ac", "2",
-    // Sync and format — output MPEG-TS to stdout
-    "-fps_mode", "cfr",
-    "-async", "1",
-    "-f", "mpegts",
-    "pipe:1",
   ];
 
-  console.log(`[relay] starting FFmpeg → stdout (MPEG-TS)`);
+  // Interlaced encoding flags (broadcast profiles)
+  if (INTERLACED) {
+    args.push("-flags", "+ilme+ildct");
+  }
+
+  // H.264-specific tuning
+  if (VIDEO_CODEC === "libx264") {
+    args.push("-preset", "veryfast", "-tune", "zerolatency");
+  }
+
+  // Sample aspect ratio
+  args.push("-vf", `setsar=${SAR}`);
+
+  // Audio
+  args.push(
+    "-c:a", AUDIO_CODEC,
+    "-b:a", AUDIO_BITRATE,
+    "-ar", "48000",
+    "-ac", "2",
+  );
+
+  // Sync
+  args.push("-fps_mode", "cfr", "-async", "1");
+
+  // Output format
+  if (FORMAT === "hls") {
+    args.push(
+      "-f", "hls",
+      "-hls_time", HLS_SEGMENT_TIME,
+      "-hls_list_size", HLS_LIST_SIZE,
+      "-hls_flags", "delete_segments",
+      "-hls_segment_filename", `${HLS_DIR}/segment%03d.ts`,
+      `${HLS_DIR}/stream.m3u8`,
+    );
+  } else {
+    args.push("-f", "mpegts", "pipe:1");
+  }
+
+  return args;
+}
+
+function startFFmpeg() {
+  // Ensure HLS output directory exists
+  if (FORMAT === "hls") {
+    fs.mkdirSync(HLS_DIR, { recursive: true });
+  }
+
+  const args = buildFFmpegArgs();
+
+  console.log(`[relay] starting FFmpeg → ${FORMAT === "hls" ? "HLS" : "stdout"} (profile: ${PROFILE})`);
+  console.log(`[relay]   ${VIDEO_CODEC} ${WIDTH}x${HEIGHT}@${FRAMERATE}fps SAR ${SAR}${INTERLACED ? " interlaced" : ""}`);
+  console.log(`[relay]   ${AUDIO_CODEC} ${AUDIO_BITRATE} 48kHz stereo`);
+
   ffmpeg = spawn("ffmpeg", args, {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
   ffmpegReady = true;
 
-  // Forward MPEG-TS output to the configured destination
+  // Forward MPEG-TS output to the configured destination (non-HLS only)
   ffmpeg.stdout.on("data", (chunk) => {
-    if (outputHandler) {
+    if (FORMAT !== "hls" && outputHandler) {
       outputHandler.write(chunk);
     }
   });
@@ -261,6 +360,10 @@ ${programmes}</tv>
 
 function deriveStreamURL() {
   if (STREAM_URL) return STREAM_URL;
+  // HLS streams are served from the built-in HTTP server
+  if (FORMAT === "hls") {
+    return `http://localhost:${WS_PORT}/stream/stream.m3u8`;
+  }
   // Derive from OUTPUT — for UDP multicast, prefix with @ for client join
   if (OUTPUT.startsWith("udp://")) {
     const parsed = new URL(OUTPUT);
@@ -279,6 +382,32 @@ function generateM3U() {
 #EXTINF:-1 tvg-id="${CHANNEL_ID}" tvg-name="${CHANNEL_NAME}" group-title="${CHANNEL_NAME}",${CHANNEL_NAME}
 ${streamUrl}
 `;
+}
+
+function serveHLSFile(pathname, res) {
+  const filename = pathname.replace("/stream/", "");
+  // Prevent path traversal
+  if (filename.includes("..") || filename.includes("/")) {
+    res.writeHead(403);
+    res.end();
+    return;
+  }
+  const filePath = `${HLS_DIR}/${filename}`;
+  const stream = fs.createReadStream(filePath);
+  const contentType = filename.endsWith(".m3u8")
+    ? "application/vnd.apple.mpegurl"
+    : "video/mp2t";
+  stream.on("open", () => {
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "no-cache",
+    });
+    stream.pipe(res);
+  });
+  stream.on("error", () => {
+    res.writeHead(404);
+    res.end();
+  });
 }
 
 function handleHTTPRequest(req, res) {
@@ -303,15 +432,24 @@ function handleHTTPRequest(req, res) {
   }
 
   if (pathname === "/health") {
-    const healthy = ffmpegReady && wsConnected && outputHandler !== null;
+    const healthy = ffmpegReady && wsConnected &&
+      (FORMAT === "hls" || outputHandler !== null);
     const body = JSON.stringify({
       status: healthy ? "healthy" : "unhealthy",
       ffmpeg: ffmpegReady,
       websocket: wsConnected,
-      output: OUTPUT,
+      profile: PROFILE,
+      format: FORMAT,
+      output: FORMAT === "hls" ? `http://localhost:${WS_PORT}/stream/stream.m3u8` : OUTPUT,
     });
     res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
     res.end(body);
+    return;
+  }
+
+  // HLS segment serving: /stream/stream.m3u8, /stream/segment000.ts, etc.
+  if (FORMAT === "hls" && pathname.startsWith("/stream/")) {
+    serveHLSFile(pathname, res);
     return;
   }
 
@@ -350,9 +488,12 @@ function startServer() {
 
   httpServer.listen(WS_PORT, () => {
     console.log(`[relay] WebSocket + HTTP server listening on port ${WS_PORT}`);
-    console.log(`[relay]   GET /guide.xml   — XMLTV programme guide`);
+    console.log(`[relay]   GET /guide.xml    — XMLTV programme guide`);
     console.log(`[relay]   GET /playlist.m3u — M3U playlist`);
     console.log(`[relay]   GET /health       — health check`);
+    if (FORMAT === "hls") {
+      console.log(`[relay]   GET /stream/*     — HLS live stream`);
+    }
   });
 }
 
@@ -360,6 +501,8 @@ function startServer() {
 // Start everything
 // ---------------------------------------------------------------------------
 
-outputHandler = createOutputHandler(OUTPUT);
+if (FORMAT !== "hls") {
+  outputHandler = createOutputHandler(OUTPUT);
+}
 startFFmpeg();
 startServer();

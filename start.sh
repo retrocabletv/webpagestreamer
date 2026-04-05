@@ -4,10 +4,8 @@
 set -euo pipefail
 
 URL="${URL:-https://www.google.com}"
-WIDTH="${WIDTH:-720}"
-HEIGHT="${HEIGHT:-576}"
-FRAMERATE="${FRAMERATE:-25}"
 OUTPUT="${OUTPUT:-udp://239.0.0.1:1234}"
+PROFILE="${PROFILE:-pal}"
 WS_PORT="${WS_PORT:-9000}"
 CDP_PORT="${CDP_PORT:-9222}"
 CHANNEL_NAME="${CHANNEL_NAME:-WebPageStreamer}"
@@ -16,12 +14,26 @@ PROGRAMME_TITLE="${PROGRAMME_TITLE:-Live Stream}"
 PROGRAMME_DESC="${PROGRAMME_DESC:-}"
 STREAM_URL="${STREAM_URL:-}"
 
+# Resolve WIDTH/HEIGHT/FRAMERATE from profile if not explicitly set
+case "$PROFILE" in
+  pal)   _W=720;  _H=576;  _F=25    ;;
+  ntsc)  _W=720;  _H=480;  _F=29.97 ;;
+  720p)  _W=1280; _H=720;  _F=30    ;;
+  1080p) _W=1920; _H=1080; _F=30    ;;
+  hls)   _W=1280; _H=720;  _F=30    ;;
+  *)     _W=720;  _H=576;  _F=25    ;;
+esac
+WIDTH="${WIDTH:-$_W}"
+HEIGHT="${HEIGHT:-$_H}"
+FRAMERATE="${FRAMERATE:-$_F}"
+
 EXTENSION_ID="akfimkeaknlnblgelnlelcgihcmconnb"
 EXTENSION_DIR="/app/extension"
 
-export URL WIDTH HEIGHT FRAMERATE OUTPUT WS_PORT CDP_PORT
+export URL WIDTH HEIGHT FRAMERATE OUTPUT PROFILE WS_PORT CDP_PORT
 export CHANNEL_NAME CHANNEL_ID PROGRAMME_TITLE PROGRAMME_DESC STREAM_URL
 
+echo "[start] Profile=$PROFILE"
 echo "[start] URL=$URL"
 echo "[start] Resolution=${WIDTH}x${HEIGHT} @ ${FRAMERATE}fps"
 echo "[start] Output=$OUTPUT"
