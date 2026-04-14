@@ -3,6 +3,15 @@ name: Docker
 on:
   pull_request:
     branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "relay/**"
+      - "extension/**"
+      - "start.sh"
+      - "trigger-capture.sh"
+      - "supervisord.conf"
+      - ".github/workflows/docker.yml"
   release:
     types: [published]
 
@@ -60,7 +69,6 @@ jobs:
           push: false
           load: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Build and push (release)
         if: github.event_name == 'release'
