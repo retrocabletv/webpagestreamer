@@ -15,8 +15,9 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Copy relay server and install deps
+COPY relay/package.json relay/package-lock.json /app/relay/
+RUN cd /app/relay && npm ci --omit=dev
 COPY relay/ /app/relay/
-RUN cd /app/relay && npm install --production
 
 # Copy extension
 COPY extension/ /app/extension/
