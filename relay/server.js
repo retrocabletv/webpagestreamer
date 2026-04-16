@@ -1,6 +1,6 @@
 // WebSocket relay server: receives WebM chunks from the Chrome extension,
 // pipes them into FFmpeg (which encodes to MPEG-TS on stdout), and forwards
-// the MPEG-TS output to the configured destination (UDP, RTP, TCP, or file).
+// the MPEG-TS output to the configured destination (UDP, RTP, TCP, HTTP, or file).
 //
 // Also serves IPTV integration endpoints:
 //   GET /guide.xml   — XMLTV electronic programme guide
@@ -98,6 +98,7 @@ function parseOutput(outputStr) {
   // UDP:  udp://host:port?opts
   // RTP:  rtp://host:port   (MPEG-TS over RTP, RFC 2250, PT=33)
   // TCP:  tcp://host:port?opts
+  // HTTP: http://host:port        (progressive MPEG-TS over HTTP)
   // File: /path/to/file.ts
   if (outputStr.startsWith("udp://")) {
     const parsed = new URL(outputStr);
@@ -119,6 +120,14 @@ function parseOutput(outputStr) {
     const parsed = new URL(outputStr);
     return {
       type: "tcp",
+      host: parsed.hostname,
+      port: parseInt(parsed.port, 10),
+    };
+  }
+  if (outputStr.startsWith("http://")) {
+    const parsed = new URL(outputStr);
+    return {
+      type: "http",
       host: parsed.hostname,
       port: parseInt(parsed.port, 10),
     };
@@ -216,6 +225,54 @@ function createOutputHandler(outputStr) {
       },
       close() {
         for (const client of clients) client.destroy();
+        server.close();
+      },
+    };
+  }
+
+  if (config.type === "http") {
+    // Progressive MPEG-TS over HTTP: clients GET the URL and receive an
+    // endless video/mp2t response. Fan out to all connected clients like TCP.
+    const clients = new Set();
+    const server = http.createServer((req, res) => {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "Content-Type": "video/mp2t", "Cache-Control": "no-cache" });
+        res.end();
+        return;
+      }
+      if (req.method !== "GET") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      console.log(`[output] HTTP client connected: ${req.socket.remoteAddress} ${req.url}`);
+      res.writeHead(200, {
+        "Content-Type": "video/mp2t",
+        "Cache-Control": "no-cache, no-store",
+        Connection: "close",
+      });
+      clients.add(res);
+      const cleanup = () => {
+        if (clients.delete(res)) {
+          console.log(`[output] HTTP client disconnected`);
+        }
+      };
+      req.on("close", cleanup);
+      res.on("error", cleanup);
+    });
+    server.listen(config.port, config.host, () => {
+      console.log(`[output] HTTP progressive MPEG-TS on ${config.host}:${config.port}`);
+    });
+    return {
+      write(chunk) {
+        for (const res of clients) {
+          if (!res.destroyed && res.writable) {
+            res.write(chunk);
+          }
+        }
+      },
+      close() {
+        for (const res of clients) res.end();
         server.close();
       },
     };
@@ -420,6 +477,12 @@ function deriveStreamURL() {
   if (OUTPUT.startsWith("tcp://")) {
     const parsed = new URL(OUTPUT);
     return `tcp://${parsed.hostname}:${parsed.port}`;
+  }
+  if (OUTPUT.startsWith("http://")) {
+    const parsed = new URL(OUTPUT);
+    // 0.0.0.0 is a bind wildcard, not a usable client address; fall back to localhost
+    const host = parsed.hostname === "0.0.0.0" ? "localhost" : parsed.hostname;
+    return `http://${host}:${parsed.port}/`;
   }
   return OUTPUT;
 }

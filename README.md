@@ -64,7 +64,7 @@ docker compose up --build
 | Variable    | Default                                    | Description                              |
 |-------------|--------------------------------------------|------------------------------------------|
 | `URL`       | `https://www.google.com`                   | Web page to capture                      |
-| `OUTPUT`    | `udp://239.0.0.1:1234`                    | Output destination (UDP, RTP, TCP, or file) |
+| `OUTPUT`    | `udp://239.0.0.1:1234`                    | Output destination (UDP, RTP, TCP, HTTP, or file) |
 | `WIDTH`     | `720`                                      | Capture width in pixels                  |
 | `HEIGHT`    | `576`                                      | Capture height in pixels (PAL: 576)      |
 | `FRAMERATE` | `25`                                       | Frames per second (PAL: 25)              |
@@ -73,7 +73,7 @@ docker compose up --build
 
 ## Output destinations
 
-The `OUTPUT` variable supports four transport types:
+The `OUTPUT` variable supports five transport types:
 
 ### TCP (recommended for local testing)
 
@@ -128,6 +128,24 @@ vlc rtp://@:5004
 ```
 
 Each RTP packet carries up to 7 TS packets (1316 bytes payload + 12-byte RTP header = 1328 bytes, safely under the 1500-byte MTU). Multicast addresses (224.0.0.0/4) are auto-detected and sent with TTL=4.
+
+### HTTP (progressive MPEG-TS)
+
+The container runs an HTTP server that responds to `GET /` (any path) with an endless `video/mp2t` body — the connect-to-play model, wrapped in HTTP so it passes through proxies, browsers, and IPTV apps that only speak HTTP. Low latency (comparable to TCP, ~200-500ms), and multiple clients can connect simultaneously.
+
+```bash
+docker run --rm -p 9876:9876 \
+  -e URL="https://example.com" \
+  -e OUTPUT="http://0.0.0.0:9876" \
+  webpagestreamer
+
+# Connect with any MPEG-TS client:
+ffplay http://127.0.0.1:9876/
+vlc http://127.0.0.1:9876/
+# Also works in <video> tags, IPTV frontends, xTeVe, Tvheadend, etc.
+```
+
+For an HLS (segmented) alternative, set `PROFILE=hls` — segments are served on `WS_PORT` at `http://<host>:9000/stream/stream.m3u8`.
 
 ### File
 
