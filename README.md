@@ -131,21 +131,24 @@ Each RTP packet carries up to 7 TS packets (1316 bytes payload + 12-byte RTP hea
 
 ### HTTP (progressive MPEG-TS)
 
-The container runs an HTTP server that responds to `GET /` (any path) with an endless `video/mp2t` body — the connect-to-play model, wrapped in HTTP so it passes through proxies, browsers, and IPTV apps that only speak HTTP. Low latency (comparable to TCP, ~200-500ms), and multiple clients can connect simultaneously.
+The stream is served at `/stream.ts` on the main `WS_PORT` HTTP server (default 9000) — no extra port to expose. Clients connect with any HTTP MPEG-TS player; low latency (comparable to TCP, ~200-500ms), and multiple clients can connect simultaneously.
 
 ```bash
-docker run --rm -p 9876:9876 \
+docker run --rm -p 9000:9000 \
   -e URL="https://example.com" \
-  -e OUTPUT="http://0.0.0.0:9876" \
+  -e OUTPUT="http" \
   webpagestreamer
 
 # Connect with any MPEG-TS client:
-ffplay http://127.0.0.1:9876/
-vlc http://127.0.0.1:9876/
+ffplay http://127.0.0.1:9000/stream.ts
+vlc http://127.0.0.1:9000/stream.ts
 # Also works in <video> tags, IPTV frontends, xTeVe, Tvheadend, etc.
+# The /playlist.m3u endpoint advertises this URL automatically.
 ```
 
-For an HLS (segmented) alternative, set `PROFILE=hls` — segments are served on `WS_PORT` at `http://<host>:9000/stream/stream.m3u8`.
+`OUTPUT=http` and `OUTPUT=http://...` are equivalent — both enable the `/stream.ts` route on `WS_PORT`. The host/port in the URL form are ignored.
+
+For an HLS (segmented) alternative, set `PROFILE=hls` — segments are served on the same port at `http://<host>:9000/stream/stream.m3u8`.
 
 ### File
 
