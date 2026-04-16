@@ -90,6 +90,10 @@ let ffmpegReady = false;
 let outputHandler = null;
 let wsConnected = false;
 
+// Clients connected to /stream.ts (populated when OUTPUT=http). Shared between
+// the HTTP request handler and the output handler's write() fan-out.
+const httpStreamClients = new Set();
+
 // ---------------------------------------------------------------------------
 // Output handlers — FFmpeg writes MPEG-TS to stdout, we forward it here
 // ---------------------------------------------------------------------------
@@ -98,7 +102,7 @@ function parseOutput(outputStr) {
   // UDP:  udp://host:port?opts
   // RTP:  rtp://host:port   (MPEG-TS over RTP, RFC 2250, PT=33)
   // TCP:  tcp://host:port?opts
-  // HTTP: http://host:port        (progressive MPEG-TS over HTTP)
+  // HTTP: "http" or "http://..." (progressive MPEG-TS served at /stream.ts on WS_PORT)
   // File: /path/to/file.ts
   if (outputStr.startsWith("udp://")) {
     const parsed = new URL(outputStr);
@@ -124,13 +128,8 @@ function parseOutput(outputStr) {
       port: parseInt(parsed.port, 10),
     };
   }
-  if (outputStr.startsWith("http://")) {
-    const parsed = new URL(outputStr);
-    return {
-      type: "http",
-      host: parsed.hostname,
-      port: parseInt(parsed.port, 10),
-    };
+  if (outputStr === "http" || outputStr.startsWith("http://")) {
+    return { type: "http" };
   }
   // Assume file path
   return { type: "file", path: outputStr };
@@ -231,49 +230,20 @@ function createOutputHandler(outputStr) {
   }
 
   if (config.type === "http") {
-    // Progressive MPEG-TS over HTTP: clients GET the URL and receive an
-    // endless video/mp2t response. Fan out to all connected clients like TCP.
-    const clients = new Set();
-    const server = http.createServer((req, res) => {
-      if (req.method === "HEAD") {
-        res.writeHead(200, { "Content-Type": "video/mp2t", "Cache-Control": "no-cache" });
-        res.end();
-        return;
-      }
-      if (req.method !== "GET") {
-        res.writeHead(405);
-        res.end();
-        return;
-      }
-      console.log(`[output] HTTP client connected: ${req.socket.remoteAddress} ${req.url}`);
-      res.writeHead(200, {
-        "Content-Type": "video/mp2t",
-        "Cache-Control": "no-cache, no-store",
-        Connection: "close",
-      });
-      clients.add(res);
-      const cleanup = () => {
-        if (clients.delete(res)) {
-          console.log(`[output] HTTP client disconnected`);
-        }
-      };
-      req.on("close", cleanup);
-      res.on("error", cleanup);
-    });
-    server.listen(config.port, config.host, () => {
-      console.log(`[output] HTTP progressive MPEG-TS on ${config.host}:${config.port}`);
-    });
+    // Progressive MPEG-TS served on the main WS_PORT HTTP server at /stream.ts.
+    // The route handler populates httpStreamClients; we just fan out chunks.
+    console.log(`[output] HTTP progressive MPEG-TS at http://<host>:${WS_PORT}/stream.ts`);
     return {
       write(chunk) {
-        for (const res of clients) {
+        for (const res of httpStreamClients) {
           if (!res.destroyed && res.writable) {
             res.write(chunk);
           }
         }
       },
       close() {
-        for (const res of clients) res.end();
-        server.close();
+        for (const res of httpStreamClients) res.end();
+        httpStreamClients.clear();
       },
     };
   }
@@ -478,11 +448,8 @@ function deriveStreamURL() {
     const parsed = new URL(OUTPUT);
     return `tcp://${parsed.hostname}:${parsed.port}`;
   }
-  if (OUTPUT.startsWith("http://")) {
-    const parsed = new URL(OUTPUT);
-    // 0.0.0.0 is a bind wildcard, not a usable client address; fall back to localhost
-    const host = parsed.hostname === "0.0.0.0" ? "localhost" : parsed.hostname;
-    return `http://${host}:${parsed.port}/`;
+  if (OUTPUT === "http" || OUTPUT.startsWith("http://")) {
+    return `http://localhost:${WS_PORT}/stream.ts`;
   }
   return OUTPUT;
 }
@@ -522,13 +489,43 @@ function serveHLSFile(pathname, res) {
 }
 
 function handleHTTPRequest(req, res) {
+  const pathname = url.parse(req.url).pathname;
+
+  // /stream.ts — progressive MPEG-TS (only when OUTPUT=http). Handle before
+  // the method gate so HEAD preflights work.
+  if (pathname === "/stream.ts" && (OUTPUT === "http" || OUTPUT.startsWith("http://"))) {
+    if (req.method === "HEAD") {
+      res.writeHead(200, { "Content-Type": "video/mp2t", "Cache-Control": "no-cache" });
+      res.end();
+      return;
+    }
+    if (req.method !== "GET") {
+      res.writeHead(405);
+      res.end();
+      return;
+    }
+    console.log(`[output] HTTP client connected: ${req.socket.remoteAddress}`);
+    res.writeHead(200, {
+      "Content-Type": "video/mp2t",
+      "Cache-Control": "no-cache, no-store",
+      Connection: "close",
+    });
+    httpStreamClients.add(res);
+    const cleanup = () => {
+      if (httpStreamClients.delete(res)) {
+        console.log(`[output] HTTP client disconnected`);
+      }
+    };
+    req.on("close", cleanup);
+    res.on("error", cleanup);
+    return;
+  }
+
   if (req.method !== "GET") {
     res.writeHead(405);
     res.end();
     return;
   }
-
-  const pathname = url.parse(req.url).pathname;
 
   if (pathname === "/guide.xml") {
     res.writeHead(200, { "Content-Type": "application/xml" });
@@ -604,6 +601,9 @@ function startServer() {
     console.log(`[relay]   GET /health       — health check`);
     if (FORMAT === "hls") {
       console.log(`[relay]   GET /stream/*     — HLS live stream`);
+    }
+    if (OUTPUT === "http" || OUTPUT.startsWith("http://")) {
+      console.log(`[relay]   GET /stream.ts    — progressive MPEG-TS`);
     }
   });
 }
