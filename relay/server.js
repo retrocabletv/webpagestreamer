@@ -429,11 +429,18 @@ ${programmes}</tv>
 `;
 }
 
-function deriveStreamURL() {
+// Host for HTTP/HLS URLs in the M3U. Uses the incoming request's Host header so
+// the URL is reachable from whoever fetched the playlist (Dispatcharr, VLC, etc.)
+// rather than a meaningless "localhost".
+function requestHost(req) {
+  return req.headers.host || `localhost:${WS_PORT}`;
+}
+
+function deriveStreamURL(req) {
   if (STREAM_URL) return STREAM_URL;
   // HLS streams are served from the built-in HTTP server
   if (FORMAT === "hls") {
-    return `http://localhost:${WS_PORT}/stream/stream.m3u8`;
+    return `http://${requestHost(req)}/stream/stream.m3u8`;
   }
   // Derive from OUTPUT — for UDP multicast, prefix with @ for client join
   if (OUTPUT.startsWith("udp://")) {
@@ -449,13 +456,13 @@ function deriveStreamURL() {
     return `tcp://${parsed.hostname}:${parsed.port}`;
   }
   if (OUTPUT === "http" || OUTPUT.startsWith("http://")) {
-    return `http://localhost:${WS_PORT}/stream.ts`;
+    return `http://${requestHost(req)}/stream.ts`;
   }
   return OUTPUT;
 }
 
-function generateM3U() {
-  const streamUrl = deriveStreamURL();
+function generateM3U(req) {
+  const streamUrl = deriveStreamURL(req);
   return `#EXTM3U
 #EXTINF:-1 tvg-id="${CHANNEL_ID}" tvg-name="${CHANNEL_NAME}" group-title="${CHANNEL_NAME}",${CHANNEL_NAME}
 ${streamUrl}
@@ -535,7 +542,7 @@ function handleHTTPRequest(req, res) {
 
   if (pathname === "/playlist.m3u") {
     res.writeHead(200, { "Content-Type": "audio/x-mpegurl" });
-    res.end(generateM3U());
+    res.end(generateM3U(req));
     return;
   }
 
