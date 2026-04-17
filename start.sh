@@ -1,12 +1,14 @@
 #!/bin/bash
-# Entrypoint script: writes per-run config and launches supervisord.
+# Entrypoint: writes mediamtx config + Chrome launcher, then starts supervisord.
 
 set -euo pipefail
 
 URL="${URL:-https://www.google.com}"
-OUTPUT="${OUTPUT:-udp://239.0.0.1:1234}"
+UDP_OUTPUT="${UDP_OUTPUT:-udp://239.0.0.1:1234}"
+HTTP_OUTPUT="${HTTP_OUTPUT:-true}"
 PROFILE="${PROFILE:-pal}"
-WS_PORT="${WS_PORT:-9000}"
+# Accept the old WS_PORT as a silent fallback for one release.
+HTTP_PORT="${HTTP_PORT:-${WS_PORT:-9000}}"
 CDP_PORT="${CDP_PORT:-9222}"
 CHANNEL_NAME="${CHANNEL_NAME:-WebPageStreamer}"
 CHANNEL_ID="${CHANNEL_ID:-webpagestreamer.1}"
@@ -30,16 +32,39 @@ FRAMERATE="${FRAMERATE:-$_F}"
 EXTENSION_ID="akfimkeaknlnblgelnlelcgihcmconnb"
 EXTENSION_DIR="/app/extension"
 
-export URL WIDTH HEIGHT FRAMERATE OUTPUT PROFILE WS_PORT CDP_PORT
+export URL WIDTH HEIGHT FRAMERATE PROFILE
+export UDP_OUTPUT HTTP_OUTPUT HTTP_PORT CDP_PORT
 export CHANNEL_NAME CHANNEL_ID PROGRAMME_TITLE PROGRAMME_DESC STREAM_URL
 
 echo "[start] Profile=$PROFILE"
 echo "[start] URL=$URL"
 echo "[start] Resolution=${WIDTH}x${HEIGHT} @ ${FRAMERATE}fps"
-echo "[start] Output=$OUTPUT"
+echo "[start] UDP_OUTPUT=$UDP_OUTPUT"
+echo "[start] HTTP_OUTPUT=$HTTP_OUTPUT"
+echo "[start] HTTP_PORT=$HTTP_PORT"
 
-# Extract the origin from the URL to allow insecure tabCapture on HTTP origins.
-# chrome.tabCapture requires HTTPS unless the origin is explicitly allowlisted.
+# mediamtx config
+cat > /etc/mediamtx.yml <<'MTXEOF'
+logLevel: info
+logDestinations: [stdout]
+
+rtsp: yes
+rtspAddress: 127.0.0.1:8554
+webrtc: yes
+webrtcAddress: 127.0.0.1:8889
+webrtcLocalUDPAddress: 127.0.0.1:8189
+webrtcAdditionalHosts: [127.0.0.1]
+hls: no
+rtmp: no
+srt: no
+api: no
+
+paths:
+  live:
+    source: publisher
+MTXEOF
+
+# Allow insecure origin for tabCapture if URL is http://
 URL_ORIGIN=$(echo "$URL" | sed -E 's|(https?://[^/]+).*|\1|')
 UNSAFELY_ALLOW=""
 if echo "$URL_ORIGIN" | grep -q "^http://"; then
@@ -47,7 +72,7 @@ if echo "$URL_ORIGIN" | grep -q "^http://"; then
     echo "[start] Allowing insecure origin for tabCapture: $URL_ORIGIN"
 fi
 
-# Write a Chrome launcher script that supervisord will run
+# Chrome launcher
 cat > /tmp/launch-chrome.sh <<SCRIPT_END
 #!/bin/bash
 exec chromium \\
@@ -74,8 +99,6 @@ exec chromium \\
 SCRIPT_END
 chmod +x /tmp/launch-chrome.sh
 
-# Export vars needed by the chrome launcher
 export EXTENSION_ID EXTENSION_DIR
 
-# Start supervisord (manages relay, chrome, and trigger)
 exec /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
