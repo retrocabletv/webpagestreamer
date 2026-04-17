@@ -41,6 +41,9 @@ WORKDIR /app
 # Copy extension
 COPY extension/ /app/extension/
 
+# Copy bundled test assets (served by relay at /test/*)
+COPY test/ /app/test/
+
 # Copy scripts and config
 COPY start.sh /app/start.sh
 COPY trigger-capture.sh /app/trigger-capture.sh
