@@ -1,6 +1,9 @@
 FROM alpine:3.21
 
-# Install dependencies: Chromium, FFmpeg, Node.js, supervisor, Python/websockets
+ARG MEDIAMTX_VERSION=v1.11.3
+ARG TARGETARCH=amd64
+
+# Install runtime dependencies: Chromium, FFmpeg, Node.js, supervisor, Python/websockets
 RUN apk add --no-cache \
     chromium \
     ffmpeg \
@@ -11,6 +14,20 @@ RUN apk add --no-cache \
     curl \
     python3 \
     py3-websockets
+
+# Install mediamtx static binary. Released tarballs are named
+# mediamtx_<ver>_linux_<arch>.tar.gz on GitHub releases.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) MTX_ARCH=amd64 ;; \
+      arm64) MTX_ARCH=arm64v8 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/mediamtx.tar.gz \
+      "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_linux_${MTX_ARCH}.tar.gz"; \
+    tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin mediamtx; \
+    chmod +x /usr/local/bin/mediamtx; \
+    rm /tmp/mediamtx.tar.gz
 
 WORKDIR /app/relay
 
@@ -32,9 +49,10 @@ RUN chmod +x /app/start.sh /app/trigger-capture.sh
 
 # Environment defaults
 ENV URL="https://www.google.com" \
-    OUTPUT="udp://239.0.0.1:1234" \
+    UDP_OUTPUT="udp://239.0.0.1:1234" \
+    HTTP_OUTPUT="true" \
     PROFILE="pal" \
-    WS_PORT="9000" \
+    HTTP_PORT="9000" \
     CDP_PORT="9222" \
     CHANNEL_NAME="WebPageStreamer" \
     CHANNEL_ID="webpagestreamer.1" \
