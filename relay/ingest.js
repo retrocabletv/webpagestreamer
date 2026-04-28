@@ -14,6 +14,9 @@ function mountIngest(httpServer, { videoSink, audioSink, expected, onVideoConnec
   const wssVideo = new WebSocketServer({ noServer: true });
   const wssAudio = new WebSocketServer({ noServer: true });
 
+  // TODO(task-5): apply back-pressure when sink.write() returns false.
+  // The fifo writer can stall if ffmpeg is slow; without pausing the WS
+  // we'd buffer raw frames in memory at ~13 MiB/s for PAL.
   wssVideo.on("connection", (ws) => {
     console.log("[ingest] video client connected");
     if (onVideoConnect) onVideoConnect(true);

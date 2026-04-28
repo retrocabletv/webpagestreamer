@@ -66,3 +66,37 @@ test("video WS connection is rejected on dimension mismatch", async () => {
 
   await new Promise((r) => httpServer.close(r));
 });
+
+test("audio WS connection is rejected on sample-rate mismatch", async () => {
+  const v = collector();
+  const a = collector();
+  const httpServer = http.createServer();
+  mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25, sampleRate: 44100, channels: 2 } });
+  await new Promise((r) => httpServer.listen(0, r));
+  const port = httpServer.address().port;
+
+  const aws = new WebSocket(`ws://127.0.0.1:${port}/ingest/audio?sr=48000&ch=2`);
+  aws.on("error", () => {});
+  await new Promise((r) => aws.once("unexpected-response", (_req, res) => {
+    assert.strictEqual(res.statusCode, 400);
+    r();
+  }));
+
+  await new Promise((r) => httpServer.close(r));
+});
+
+test("unknown ingest pathname destroys the upgrade socket", async () => {
+  const v = collector();
+  const a = collector();
+  const httpServer = http.createServer();
+  mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25, sampleRate: 44100, channels: 2 } });
+  await new Promise((r) => httpServer.listen(0, r));
+  const port = httpServer.address().port;
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ingest/bogus`);
+  ws.on("error", () => {});
+  // socket.destroy() with no response → ws sees connection closed before handshake.
+  await new Promise((r) => ws.once("close", () => r()));
+
+  await new Promise((r) => httpServer.close(r));
+});
