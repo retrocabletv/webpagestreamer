@@ -30,13 +30,18 @@ FRAMERATE="${FRAMERATE:-$_F}"
 EXTENSION_ID="akfimkeaknlnblgelnlelcgihcmconnb"
 EXTENSION_DIR="/app/extension"
 
+INGEST_MODE="${INGEST_MODE:-webm}"
+CAPTURE_MODE="${CAPTURE_MODE:-$INGEST_MODE}"
+
 export URL WIDTH HEIGHT FRAMERATE OUTPUT PROFILE WS_PORT CDP_PORT
 export CHANNEL_NAME CHANNEL_ID PROGRAMME_TITLE PROGRAMME_DESC STREAM_URL
+export INGEST_MODE CAPTURE_MODE
 
 echo "[start] Profile=$PROFILE"
 echo "[start] URL=$URL"
 echo "[start] Resolution=${WIDTH}x${HEIGHT} @ ${FRAMERATE}fps"
 echo "[start] Output=$OUTPUT"
+echo "[start] Ingest=$INGEST_MODE (extension captureMode=$CAPTURE_MODE)"
 
 # Extract the origin from the URL to allow insecure tabCapture on HTTP origins.
 # chrome.tabCapture requires HTTPS unless the origin is explicitly allowlisted.

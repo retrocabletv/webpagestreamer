@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>A/V Drift Test Clock</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; background: #000; color: #0f0;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      height: 100%; width: 100%;
+      overflow: hidden;
+    }
+    .wrap {
+      width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 1vh;
+    }
+    #clock {
+      font-size: 16vh; font-weight: 700; letter-spacing: -0.04em;
+      text-shadow: 0 0 20px rgba(0,255,0,0.4);
+    }
+    #beat {
+      font-size: 4vh; opacity: 0.8;
+    }
+    #bar {
+      width: 80vw; height: 4vh; background: #030; border: 1px solid #0a0;
+      position: relative; overflow: hidden;
+    }
+    #bar::after {
+      content: "";
+      position: absolute; top: 0; left: 0; bottom: 0;
+      width: var(--progress, 0%);
+      background: #0f0;
+    }
+    .beep { color: #ff0 !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="clock">00:00:00.000</div>
+    <div id="beat">tick</div>
+    <div id="bar"></div>
+  </div>
+
+  <script>
+    const clockEl = document.getElementById("clock");
+    const beatEl = document.getElementById("beat");
+    const barEl = document.getElementById("bar");
+
+    function render() {
+      const now = new Date();
+      const h = String(now.getUTCHours()).padStart(2, "0");
+      const m = String(now.getUTCMinutes()).padStart(2, "0");
+      const s = String(now.getUTCSeconds()).padStart(2, "0");
+      const ms = String(now.getUTCMilliseconds()).padStart(3, "0");
+      clockEl.textContent = `${h}:${m}:${s}.${ms}`;
+      barEl.style.setProperty("--progress", (now.getUTCMilliseconds() / 10) + "%");
+      requestAnimationFrame(render);
+    }
+    requestAnimationFrame(render);
+
+    // WebAudio tone at every second boundary: 50ms at 1000Hz, then 20ms at 440Hz
+    // once we pass the half-second mark, to help distinguish the boundary edge.
+    let audioCtx;
+    function ensureAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+    }
+
+    function beep(freq, durationMs) {
+      ensureAudio();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.value = 0.15;
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + durationMs / 1000);
+    }
+
+    let lastSec = -1;
+    function scheduler() {
+      const now = new Date();
+      const s = now.getUTCSeconds();
+      if (s !== lastSec) {
+        lastSec = s;
+        beep(1000, 50);
+        beatEl.textContent = "BEEP " + s;
+        beatEl.classList.add("beep");
+        setTimeout(() => beatEl.classList.remove("beep"), 80);
+      }
+      setTimeout(scheduler, 5);
+    }
+
+    // WebAudio needs a user gesture to start, but --autoplay-policy=no-user-gesture-required
+    // is passed to Chrome in start.sh, so it should resume on its own.
+    scheduler();
+  </script>
+</body>
+</html>
