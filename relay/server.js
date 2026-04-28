@@ -1,13 +1,22 @@
 // Relay server: ingests raw I420 video frames + f32le audio chunks from the
 // Chrome extension over two WebSockets (see ./ingest.js for the wire protocol),
 // fans them through named pipes into ffmpeg, which encodes to MPEG-TS and
-// writes to the configured OUTPUT (UDP/RTP/TCP/HTTP/file).
+// pushes to the configured OUTPUT destination.
 //
-// Also serves IPTV integration endpoints:
+// OUTPUT modes (all native ffmpeg outputs — no custom Node networking):
+//   udp://host:port   — UDP / multicast (raw MPEG-TS). Standard for IPTV.
+//   rtp://host:port   — MPEG-TS over RTP (RFC 2250)
+//   tcp://host:port   — TCP listener (raw MPEG-TS, single concurrent client)
+//   /path/to/file.ts  — write to file
+//
+// For multi-client HTTP / HLS / RTSP / WebRTC fanout, run mediamtx (or
+// mptsd, nginx-rtmp, etc.) downstream and aim OUTPUT at it — e.g.
+// OUTPUT=udp://<mediamtx-host>:9999 with mediamtx ingesting MPEG-TS-UDP.
+//
+// Also serves IPTV integration endpoints on WS_PORT:
 //   GET /guide.xml    — XMLTV electronic programme guide
 //   GET /playlist.m3u — M3U playlist for IPTV clients
 //   GET /health       — stream health check
-//   GET /stream.ts    — progressive MPEG-TS (when OUTPUT=http)
 
 const http = require("http");
 const { spawn, execFileSync } = require("child_process");
@@ -63,12 +72,6 @@ const PROFILES = {
     videoBitrate: "5000k", audioBitrate: "128k",
     sar: "1/1", interlaced: false, format: "mpegts",
   },
-  hls: {
-    width: 1280, height: 720, framerate: 30,
-    videoCodec: "libx264", audioCodec: "aac",
-    videoBitrate: "2500k", audioBitrate: "128k",
-    sar: "1/1", interlaced: false, format: "hls",
-  },
 };
 
 const baseProfile = PROFILES[PROFILE] || PROFILES.pal;
@@ -90,12 +93,6 @@ const SAR = process.env.SAR || baseProfile.sar;
 const INTERLACED = process.env.INTERLACED
   ? process.env.INTERLACED === "true"
   : baseProfile.interlaced;
-const FORMAT = process.env.FORMAT || baseProfile.format;
-
-const HLS_DIR = "/tmp/hls";
-const HLS_SEGMENT_TIME = process.env.HLS_SEGMENT_TIME || "2";
-const HLS_LIST_SIZE = process.env.HLS_LIST_SIZE || "5";
-
 let ffmpeg = null;
 let ffmpegReady = false;
 let outputHandler = null;
@@ -103,10 +100,6 @@ let videoIngestConnected = false;
 let audioIngestConnected = false;
 let videoFifoWriter = null;
 let audioFifoWriter = null;
-
-// Clients connected to /stream.ts (populated when OUTPUT=http). Shared between
-// the HTTP request handler and the output handler's write() fan-out.
-const httpStreamClients = new Set();
 
 // ---------------------------------------------------------------------------
 // Output handlers — FFmpeg writes MPEG-TS to stdout, we forward it here
@@ -133,34 +126,18 @@ function parseOutput(outputStr) {
   // UDP:  udp://host:port?opts
   // RTP:  rtp://host:port   (MPEG-TS over RTP, RFC 2250, PT=33)
   // TCP:  tcp://host:port?opts
-  // HTTP: "http" or "http://..." (progressive MPEG-TS served at /stream.ts on WS_PORT)
   // File: /path/to/file.ts
   if (outputStr.startsWith("udp://")) {
     const parsed = new URL(outputStr);
-    return {
-      type: "udp",
-      host: parsed.hostname,
-      port: parseInt(parsed.port, 10),
-    };
+    return { type: "udp", host: parsed.hostname, port: parseInt(parsed.port, 10) };
   }
   if (outputStr.startsWith("rtp://")) {
     const parsed = new URL(outputStr);
-    return {
-      type: "rtp",
-      host: parsed.hostname,
-      port: parseInt(parsed.port, 10),
-    };
+    return { type: "rtp", host: parsed.hostname, port: parseInt(parsed.port, 10) };
   }
   if (outputStr.startsWith("tcp://")) {
     const parsed = new URL(outputStr);
-    return {
-      type: "tcp",
-      host: parsed.hostname,
-      port: parseInt(parsed.port, 10),
-    };
-  }
-  if (outputStr === "http" || outputStr.startsWith("http://")) {
-    return { type: "http" };
+    return { type: "tcp", host: parsed.hostname, port: parseInt(parsed.port, 10) };
   }
   // Assume file path
   return { type: "file", path: outputStr };
@@ -257,25 +234,6 @@ function createOutputHandler(outputStr) {
     };
   }
 
-  if (config.type === "http") {
-    // Progressive MPEG-TS served on the main WS_PORT HTTP server at /stream.ts.
-    // The route handler populates httpStreamClients; we just fan out chunks.
-    console.log(`[output] HTTP progressive MPEG-TS at http://<host>:${WS_PORT}/stream.ts`);
-    return {
-      write(chunk) {
-        for (const res of httpStreamClients) {
-          if (!res.destroyed && res.writable) {
-            res.write(chunk);
-          }
-        }
-      },
-      close() {
-        for (const res of httpStreamClients) res.end();
-        httpStreamClients.clear();
-      },
-    };
-  }
-
   if (config.type === "file") {
     const stream = fs.createWriteStream(config.path);
     console.log(`[output] File → ${config.path}`);
@@ -299,10 +257,11 @@ function buildFFmpegArgs() {
   const args = [
     "-fflags", "+genpts",
 
-    // Raw I420 video pipe. PTS derives from -framerate (sample-count clock).
-    // Don't use -use_wallclock_as_timestamps here: it stamps PTS with unix
-    // wall-time (~1.7e9) while PCR starts near zero, causing players to
-    // buffer waiting for PCR to catch up.
+    // Raw I420 video pipe. The extension throttles to exactly FRAMERATE
+    // before sending, so we can use the simple sample-count clock here:
+    // each frame read from the fifo is stamped at N × (1/FRAMERATE) sec.
+    // Wallclock-stamped PTS would just import any browser jitter and make
+    // -fps_mode cfr churn out duplicates.
     "-f", "rawvideo",
     "-pix_fmt", "yuv420p",
     "-s", `${WIDTH}x${HEIGHT}`,
@@ -340,25 +299,14 @@ function buildFFmpegArgs() {
 
   args.push("-fps_mode", "cfr");
 
-  if (FORMAT === "hls") {
-    args.push(
-      "-f", "hls",
-      "-hls_time", HLS_SEGMENT_TIME,
-      "-hls_list_size", HLS_LIST_SIZE,
-      "-hls_flags", "delete_segments",
-      "-hls_segment_filename", `${HLS_DIR}/segment%03d.ts`,
-      `${HLS_DIR}/stream.m3u8`,
-    );
-  } else {
-    args.push(
-      "-flush_packets", "1",
-      "-f", "mpegts",
-      "-mpegts_flags", "+resend_headers",
-      "-muxdelay", "0",
-      "-muxpreload", "0",
-      "pipe:1",
-    );
-  }
+  args.push(
+    "-flush_packets", "1",
+    "-f", "mpegts",
+    "-mpegts_flags", "+resend_headers",
+    "-muxdelay", "0",
+    "-muxpreload", "0",
+    "pipe:1",
+  );
 
   return args;
 }
@@ -371,11 +319,6 @@ function setupPipes() {
 }
 
 function startFFmpeg() {
-  // Ensure HLS output directory exists
-  if (FORMAT === "hls") {
-    fs.mkdirSync(HLS_DIR, { recursive: true });
-  }
-
   // Recreate the named pipes on every spawn. The kernel pipe buffer can
   // hold partial frames from a dead ffmpeg; reading them as if fresh would
   // misalign rawvideo. unlink+mkfifo gives us a pristine fifo each life.
@@ -383,7 +326,7 @@ function startFFmpeg() {
 
   const args = buildFFmpegArgs();
 
-  console.log(`[relay] starting FFmpeg → ${FORMAT === "hls" ? "HLS" : "stdout"} (profile: ${PROFILE})`);
+  console.log(`[relay] starting FFmpeg → MPEG-TS on stdout (profile: ${PROFILE})`);
   console.log(`[relay]   ${VIDEO_CODEC} ${WIDTH}x${HEIGHT}@${FRAMERATE}fps SAR ${SAR}${INTERLACED ? " interlaced" : ""}`);
   console.log(`[relay]   ${AUDIO_CODEC} ${AUDIO_BITRATE} 48kHz stereo (in: 44.1 kHz)`);
 
@@ -405,11 +348,9 @@ function startFFmpeg() {
     ffmpegReady = true;
   });
 
-  // Forward MPEG-TS output to the configured destination (non-HLS only)
+  // Forward MPEG-TS output to the configured destination
   ffmpeg.stdout.on("data", (chunk) => {
-    if (FORMAT !== "hls" && outputHandler) {
-      outputHandler.write(chunk);
-    }
+    if (outputHandler) outputHandler.write(chunk);
   });
 
   ffmpeg.stderr.on("data", (data) => {
@@ -501,10 +442,6 @@ function requestHost(req) {
 
 function deriveStreamURL(req) {
   if (STREAM_URL) return STREAM_URL;
-  // HLS streams are served from the built-in HTTP server
-  if (FORMAT === "hls") {
-    return `http://${requestHost(req)}/stream/stream.m3u8`;
-  }
   // Derive from OUTPUT — for UDP multicast, prefix with @ for client join
   if (OUTPUT.startsWith("udp://")) {
     const parsed = new URL(OUTPUT);
@@ -518,9 +455,6 @@ function deriveStreamURL(req) {
     const parsed = new URL(OUTPUT);
     return `tcp://${parsed.hostname}:${parsed.port}`;
   }
-  if (OUTPUT === "http" || OUTPUT.startsWith("http://")) {
-    return `http://${requestHost(req)}/stream.ts`;
-  }
   return OUTPUT;
 }
 
@@ -532,64 +466,8 @@ ${streamUrl}
 `;
 }
 
-function serveHLSFile(pathname, res) {
-  const filename = pathname.replace("/stream/", "");
-  // Prevent path traversal
-  if (filename.includes("..") || filename.includes("/")) {
-    res.writeHead(403);
-    res.end();
-    return;
-  }
-  const filePath = `${HLS_DIR}/${filename}`;
-  const stream = fs.createReadStream(filePath);
-  const contentType = filename.endsWith(".m3u8")
-    ? "application/vnd.apple.mpegurl"
-    : "video/mp2t";
-  stream.on("open", () => {
-    res.writeHead(200, {
-      "Content-Type": contentType,
-      "Cache-Control": "no-cache",
-    });
-    stream.pipe(res);
-  });
-  stream.on("error", () => {
-    res.writeHead(404);
-    res.end();
-  });
-}
-
 function handleHTTPRequest(req, res) {
   const pathname = url.parse(req.url).pathname;
-
-  // /stream.ts — progressive MPEG-TS (only when OUTPUT=http). Handle before
-  // the method gate so HEAD preflights work.
-  if (pathname === "/stream.ts" && (OUTPUT === "http" || OUTPUT.startsWith("http://"))) {
-    if (req.method === "HEAD") {
-      res.writeHead(200, { "Content-Type": "video/mp2t", "Cache-Control": "no-cache" });
-      res.end();
-      return;
-    }
-    if (req.method !== "GET") {
-      res.writeHead(405);
-      res.end();
-      return;
-    }
-    console.log(`[output] HTTP client connected: ${req.socket.remoteAddress}`);
-    res.writeHead(200, {
-      "Content-Type": "video/mp2t",
-      "Cache-Control": "no-cache, no-store",
-      Connection: "close",
-    });
-    httpStreamClients.add(res);
-    const cleanup = () => {
-      if (httpStreamClients.delete(res)) {
-        console.log(`[output] HTTP client disconnected`);
-      }
-    };
-    req.on("close", cleanup);
-    res.on("error", cleanup);
-    return;
-  }
 
   if (req.method !== "GET") {
     res.writeHead(405);
@@ -611,23 +489,16 @@ function handleHTTPRequest(req, res) {
 
   if (pathname === "/health") {
     const healthy = ffmpegReady && videoIngestConnected && audioIngestConnected
-      && (FORMAT === "hls" || outputHandler !== null);
+      && outputHandler !== null;
     const body = JSON.stringify({
       status: healthy ? "healthy" : "unhealthy",
       ffmpeg: ffmpegReady,
       ingest: { video: videoIngestConnected, audio: audioIngestConnected },
       profile: PROFILE,
-      format: FORMAT,
-      output: FORMAT === "hls" ? `http://localhost:${WS_PORT}/stream/stream.m3u8` : OUTPUT,
+      output: OUTPUT,
     });
     res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
     res.end(body);
-    return;
-  }
-
-  // HLS segment serving: /stream/stream.m3u8, /stream/segment000.ts, etc.
-  if (FORMAT === "hls" && pathname.startsWith("/stream/")) {
-    serveHLSFile(pathname, res);
     return;
   }
 
@@ -682,12 +553,6 @@ function startServer() {
     console.log(`[relay]   GET /guide.xml    — XMLTV programme guide`);
     console.log(`[relay]   GET /playlist.m3u — M3U playlist`);
     console.log(`[relay]   GET /health       — health check`);
-    if (FORMAT === "hls") {
-      console.log(`[relay]   GET /stream/*     — HLS live stream`);
-    }
-    if (OUTPUT === "http" || OUTPUT.startsWith("http://")) {
-      console.log(`[relay]   GET /stream.ts    — progressive MPEG-TS`);
-    }
   });
 }
 
@@ -695,8 +560,6 @@ function startServer() {
 // Start everything
 // ---------------------------------------------------------------------------
 
-if (FORMAT !== "hls") {
-  outputHandler = createOutputHandler(OUTPUT);
-}
+outputHandler = createOutputHandler(OUTPUT);
 startFFmpeg();
 startServer();

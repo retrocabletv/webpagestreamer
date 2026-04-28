@@ -4,33 +4,43 @@ A Docker container that captures any web page and streams it as MPEG-TS. Uses a 
 
 Inspired by [smallbraineng/webstreamer](https://github.com/smallbraineng/webstreamer), but outputs MPEG-TS to a configurable destination instead of streaming to Twitch over RTMP.
 
+## Scope
+
+This tool produces an **MPEG-TS stream** from a captured web page and pushes it to one transport (UDP / RTP / TCP / file). For multi-client HTTP/HLS/RTSP/WebRTC fanout, point the OUTPUT at a downstream server such as [mediamtx](https://github.com/bluenviron/mediamtx), [mptsd](https://github.com/gfto/mptsd), or nginx-rtmp.
+
 ## How it works
 
 ```
 Chromium (headless, with capture extension)
     │
-    ├── Content script captures tab via chrome.tabCapture API
-    │   └── MediaRecorder encodes to WebM (VP8 + Opus)
-    │
-    └── WebSocket ──► Relay server (Node.js)
-                          │
-                          └── FFmpeg (MPEG-2 + MP2 ──► MPEG-TS)
-                                  │
-                                  └── UDP / TCP / file output
+    ├── chrome.tabCapture → MediaStream (audio + video tracks)
+    ├── MediaStreamTrackProcessor(video) → I420 frames
+    └── MediaStreamTrackProcessor(audio) → f32le PCM
+              │
+              └── two WebSockets (binary, ~25 fps + ~44.1 kHz)
+                        │
+                        ▼
+                  Relay (Node.js)
+                        │
+                        └── named pipes → FFmpeg → MPEG-TS
+                                            │
+                                            └── OUTPUT (UDP / RTP / TCP / file)
 ```
 
-1. **Chromium** launches headless with a built-in extension that captures the active tab's audio and video using `chrome.tabCapture`
-2. The **content script** records the media stream as WebM and sends chunks over WebSocket to a local relay server
-3. The **relay server** (Node.js) pipes the WebM data into **FFmpeg**, which transcodes to MPEG-2/MP2 MPEG-TS on stdout
-4. The relay's **output handler** forwards the MPEG-TS to the configured destination (UDP, TCP server, or file)
-5. **Supervisord** manages all processes (relay, Chrome, capture trigger) and restarts them on failure
+1. **Chromium** launches headless with a built-in extension that captures the active tab's audio and video using `chrome.tabCapture`.
+2. The **content script** uses `MediaStreamTrackProcessor` to get raw `VideoFrame` and `AudioData` objects, packs them as I420 + interleaved f32le, and ships them over two WebSocket connections.
+3. The **relay** writes each WS message into a named pipe; **FFmpeg** reads the two pipes as `-f rawvideo` + `-f f32le` and encodes to MPEG-TS.
+4. FFmpeg pushes MPEG-TS to the configured `OUTPUT` (UDP, RTP, TCP listener, or file).
+5. **Supervisord** manages all processes and restarts them on failure.
+
+The relay also serves IPTV integration endpoints (XMLTV guide, M3U playlist, health) on `WS_PORT` for use by IPTV gateways.
 
 ## Quick start
 
 ```bash
 docker build -t webpagestreamer .
 
-# Stream a webpage over TCP (easiest way to verify it works)
+# Stream over TCP (one-client testing)
 docker run --rm -p 9876:9876 \
   -e URL="https://example.com" \
   -e OUTPUT="tcp://0.0.0.0:9876" \
@@ -42,173 +52,141 @@ ffplay -f mpegts tcp://127.0.0.1:9876
 
 ### Test script
 
-The easiest way to verify everything works:
-
 ```bash
-./test.sh                           # Builds, runs with TCP output, shows connection info
-URL="https://example.com" ./test.sh # Custom URL
-DURATION=60 ./test.sh               # Run for 60s instead of default 30s
-```
-
-Then connect from another terminal with `ffplay -f mpegts tcp://127.0.0.1:9876` or VLC.
-
-### Using docker-compose
-
-```bash
-# Edit docker-compose.yml to set your URL and output, then:
-docker compose up --build
+./test.sh                           # Builds, runs with TCP output
+URL="https://example.com" ./test.sh
+DURATION=60 ./test.sh
 ```
 
 ## Environment variables
 
-| Variable    | Default                                    | Description                              |
-|-------------|--------------------------------------------|------------------------------------------|
-| `URL`       | `https://www.google.com`                   | Web page to capture                      |
-| `OUTPUT`    | `udp://239.0.0.1:1234`                    | Output destination (UDP, RTP, TCP, HTTP, or file) |
-| `WIDTH`     | `720`                                      | Capture width in pixels                  |
-| `HEIGHT`    | `576`                                      | Capture height in pixels (PAL: 576)      |
-| `FRAMERATE` | `25`                                       | Frames per second (PAL: 25)              |
-| `WS_PORT`   | `9000`                                     | Internal WebSocket relay port            |
-| `CDP_PORT`  | `9222`                                     | Chrome DevTools Protocol port            |
+| Variable    | Default                  | Description                              |
+|-------------|--------------------------|------------------------------------------|
+| `URL`       | `https://www.google.com` | Web page to capture                      |
+| `OUTPUT`    | `udp://239.0.0.1:1234`   | UDP / RTP / TCP / file destination       |
+| `PROFILE`   | `pal`                    | Encoding profile (`pal`, `ntsc`, `720p`, `1080p`) |
+| `WIDTH`     | from profile             | Capture width in pixels                  |
+| `HEIGHT`    | from profile             | Capture height in pixels                 |
+| `FRAMERATE` | from profile             | Frames per second                        |
+| `WS_PORT`   | `9000`                   | Port for IPTV metadata endpoints + WS ingest |
+| `CDP_PORT`  | `9222`                   | Chrome DevTools Protocol port (internal) |
 
-## Output destinations
+Encoding overrides: `VIDEO_CODEC`, `AUDIO_CODEC`, `VIDEO_BITRATE`, `AUDIO_BITRATE`, `SAR`, `INTERLACED`, `B_FRAMES` all override the profile defaults.
 
-The `OUTPUT` variable supports five transport types:
+IPTV metadata: `CHANNEL_NAME`, `CHANNEL_ID`, `PROGRAMME_TITLE`, `PROGRAMME_DESC`, `STREAM_URL`.
+
+## OUTPUT modes
 
 ### TCP (recommended for local testing)
 
-The container runs a TCP server. Multiple clients can connect simultaneously. No timing or routing issues.
+The container runs a TCP server on the configured port. One concurrent client; subsequent connects share the live stream.
 
 ```bash
 docker run --rm -p 9876:9876 \
-  -e URL="https://example.com" \
-  -e OUTPUT="tcp://0.0.0.0:9876" \
-  webpagestreamer
-
-# Connect with any MPEG-TS player:
+  -e OUTPUT="tcp://0.0.0.0:9876" webpagestreamer
 ffplay -f mpegts tcp://127.0.0.1:9876
-vlc tcp://127.0.0.1:9876
-ffmpeg -f mpegts -i tcp://127.0.0.1:9876 -t 10 -c copy clip.ts
 ```
 
 ### UDP unicast / multicast
 
-Best for production use where you need to feed an IPTV headend, hardware decoder, or network receiver.
+Best for IPTV / broadcast workflows. UDP is push-only — point the encoder at the destination IP and port.
 
 ```bash
-# Unicast to a specific host
+# Unicast to a specific host (e.g. an mptsd input)
 docker run --rm \
-  -e URL="https://example.com" \
-  -e OUTPUT="udp://192.168.1.100:1234" \
-  webpagestreamer
+  -e OUTPUT="udp://192.168.1.100:1234" webpagestreamer
 
-# Multicast (requires --network host on Linux; does NOT work on macOS Docker)
+# Multicast (Linux only — requires --network host; does NOT work on macOS Docker)
 docker run --rm --network host \
-  -e URL="https://example.com" \
-  -e OUTPUT="udp://239.0.0.1:1234" \
-  webpagestreamer
+  -e OUTPUT="udp://239.0.0.1:1234" webpagestreamer
 ```
 
-> **Note:** UDP multicast does not work from Docker on macOS because Docker Desktop runs inside a Linux VM that doesn't route multicast to the host. Use TCP for local testing on Mac, or `--network host` on a Linux host.
+> **Note:** UDP multicast does not work from Docker on macOS — Docker Desktop's Linux VM doesn't bridge multicast to the host. Use TCP for local testing on Mac, `--network host` on Linux.
 
-### RTP (MPEG-TS over RTP)
+### RTP (MPEG-TS over RTP, RFC 2250)
 
-MPEG-TS encapsulated in RTP per RFC 2250 (payload type 33). Use this for receivers that expect RTP framing, such as [mptsd](https://github.com/gfto/mptsd) and some professional IPTV gateways.
+For receivers that want RTP framing — e.g. [mptsd](https://github.com/gfto/mptsd), some professional IPTV gateways.
 
 ```bash
-# Unicast RTP to an mptsd input
 docker run --rm \
-  -e URL="https://example.com" \
-  -e OUTPUT="rtp://192.168.1.100:5004" \
-  webpagestreamer
+  -e OUTPUT="rtp://192.168.1.100:5004" webpagestreamer
 
-# Play with ffplay/VLC
+# To receive:
 ffplay -f rtp -i rtp://@:5004
-vlc rtp://@:5004
 ```
 
-Each RTP packet carries up to 7 TS packets (1316 bytes payload + 12-byte RTP header = 1328 bytes, safely under the 1500-byte MTU). Multicast addresses (224.0.0.0/4) are auto-detected and sent with TTL=4.
-
-### HTTP (progressive MPEG-TS)
-
-The stream is served at `/stream.ts` on the main `WS_PORT` HTTP server (default 9000) — no extra port to expose. Clients connect with any HTTP MPEG-TS player; low latency (comparable to TCP, ~200-500ms), and multiple clients can connect simultaneously.
-
-```bash
-docker run --rm -p 9000:9000 \
-  -e URL="https://example.com" \
-  -e OUTPUT="http" \
-  webpagestreamer
-
-# Connect with any MPEG-TS client:
-ffplay http://127.0.0.1:9000/stream.ts
-vlc http://127.0.0.1:9000/stream.ts
-# Also works in <video> tags, IPTV frontends, xTeVe, Tvheadend, etc.
-# The /playlist.m3u endpoint advertises this URL automatically.
-```
-
-`OUTPUT=http` and `OUTPUT=http://...` are equivalent — both enable the `/stream.ts` route on `WS_PORT`. The host/port in the URL form are ignored.
-
-For an HLS (segmented) alternative, set `PROFILE=hls` — segments are served on the same port at `http://<host>:9000/stream/stream.m3u8`.
+Each RTP packet carries up to 7 TS packets (1316 B payload + 12 B header = 1328 B, safely under 1500 MTU). Multicast addresses (224.0.0.0/4) auto-detect and send with TTL=4.
 
 ### File
 
-Useful for debugging or recording.
+Useful for recording / debugging.
 
 ```bash
 docker run --rm -v /tmp:/output \
-  -e URL="https://example.com" \
-  -e OUTPUT="/output/stream.ts" \
-  webpagestreamer
-
-# Let it run, then play:
+  -e OUTPUT="/output/stream.ts" webpagestreamer
 ffplay /tmp/stream.ts
 ```
 
-## FFmpeg encoding settings
+## Wanting HLS / multi-client HTTP / RTSP / WebRTC?
 
-- **Video**: MPEG-2 (mpeg2video), 5 Mbps, interlaced flags, SAR 12:11 (PAL 4:3)
-- **Audio**: MPEG-2 Layer 2 (MP2), 256 kbps, 48 kHz stereo
-- **Container**: MPEG-TS (mpegts)
-- **GOP**: 0.5 seconds (fast channel joining)
-- **Pixel format**: yuv420p
+Run a downstream streaming server. Recipe with mediamtx:
+
+```bash
+# 1. Run mediamtx somewhere on the LAN, configured to ingest MPEG-TS over UDP
+#    (see https://github.com/bluenviron/mediamtx — "MPEG-TS over UDP" publish).
+
+# 2. Point this container at it:
+docker run --rm \
+  -e URL="https://example.com" \
+  -e OUTPUT="udp://<mediamtx-host>:9999" \
+  webpagestreamer
+
+# 3. Consume from mediamtx — RTSP, HLS, WebRTC, etc.
+```
+
+For H.264-codec consumers, also set `-e PROFILE=720p` (or override with `VIDEO_CODEC=libx264 AUDIO_CODEC=aac`) so mediamtx's HLS muxer accepts the stream.
+
+## Encoding defaults
+
+PAL profile (`PROFILE=pal`):
+
+- **Video**: MPEG-2 (mpeg2video), 5 Mbps, progressive, SAR 12:11 (PAL 4:3)
+- **Audio**: MPEG-2 Layer 2 (MP2), 256 kbps, 48 kHz stereo (resampled from browser's 44.1 kHz)
+- **GOP**: ~0.5 s (fast channel joining)
+- **B-frames**: 0 (set `B_FRAMES=2` for better compression at cost of latency)
+
+For broadcast PAL specifically (interlaced 25i), set `INTERLACED=true`. Default is progressive because that's what nearly every modern player wants.
 
 ## Project structure
 
 ```
-├── Dockerfile              # Alpine-based container image
-├── docker-compose.yml      # Compose file for easy local usage
-├── test.sh                 # Quick test: builds and streams over TCP
-├── start.sh                # Entrypoint: configures and launches supervisord
-├── supervisord.conf        # Process manager for relay, Chrome, and trigger
-├── trigger-capture.sh      # Uses CDP to tell the extension to start capturing
+├── Dockerfile              # Alpine + Chromium + ffmpeg + Node + supervisord
+├── docker-compose.yml
+├── test.sh
+├── start.sh                # Entrypoint
+├── supervisord.conf
+├── trigger-capture.sh      # CDP-driven capture trigger
 ├── relay/
-│   ├── server.js           # WebSocket → FFmpeg → output transport
+│   ├── server.js           # WS ingest → fifos → ffmpeg → OUTPUT
+│   ├── ingest.js           # WS endpoints for raw video + audio
 │   └── package.json
 └── extension/
-    ├── manifest.json        # Chrome extension manifest (Manifest V3)
-    ├── background.js        # Gets tabCapture stream ID
-    └── content.js           # Captures media stream, sends via WebSocket
+    ├── manifest.json
+    ├── background.js       # tabCapture stream-ID broker
+    └── content.js          # MediaStreamTrackProcessor → WebSocket
 ```
 
 ## Troubleshooting
 
-**Container starts but no output stream**
-- Check logs with `docker logs <container>` — look for `[trigger]`, `[capture]`, and `[relay]` messages
-- The trigger script waits up to 60 seconds for Chrome CDP, then retries on failure
-- For TCP, verify you can connect to the port: `nc -z 127.0.0.1 9876`
-
-**High latency**
-- The MediaRecorder uses a 20ms timeslice for low latency
-- Network conditions between the container and receiver affect end-to-end latency
+**No output stream**
+- `docker logs <container>` — look for `[trigger]`, `[capture]`, `[ingest]`, `[ffmpeg]`.
+- For TCP/UDP destinations: confirm port reachability from the receiver.
 
 **HTTP URLs fail to capture (tabCapture error)**
-- Chrome's `tabCapture` API requires HTTPS. The container automatically allows insecure origins for `http://` URLs via `--unsafely-treat-insecure-origin-as-secure`
-- Content script also hides scrollbars and Chrome media overlay icons
+- Chrome's `tabCapture` requires HTTPS. The container auto-allows `http://` URLs via `--unsafely-treat-insecure-origin-as-secure`.
 
-**UDP multicast not working**
-- Does not work on macOS Docker — use TCP for local testing
-- On Linux, use `--network host` to allow multicast routing
-- Check that your network infrastructure supports multicast (IGMP snooping, etc.)
+**UDP multicast not working on macOS**
+- Known Docker Desktop limitation. Use TCP for local testing, or run on Linux with `--network host`.
 
 **Accessing a local dev server from the container**
 - Use `host.docker.internal` instead of `localhost`:

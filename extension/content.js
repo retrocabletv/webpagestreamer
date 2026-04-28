@@ -24,18 +24,14 @@
     document.documentElement.appendChild(style);
   }
 
-  function forceFrames() {
-    const el = document.createElement("div");
-    el.style.cssText =
-      "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;pointer-events:none;z-index:2147483647;";
-    document.documentElement.appendChild(el);
-    let toggle = false;
-    (function tick() {
-      toggle = !toggle;
-      el.style.opacity = toggle ? "0.01" : "0.02";
-      requestAnimationFrame(tick);
-    })();
-  }
+  // Previously we toggled an invisible div via requestAnimationFrame at 60Hz
+  // to keep Chromium's compositor producing frames on static pages. With
+  // tabCapture's MediaStreamTrackProcessor that's no longer needed — the
+  // capture pipeline produces frames at the requested rate from compositor
+  // output regardless. Keeping the rAF tick was actively harmful: it dragged
+  // the compositor up to 60Hz, made the capture stream burst at 60fps, and
+  // forced our intake throttle to drop ~40% of frames chaotically.
+  function forceFrames() { /* intentionally a no-op */ }
 
   async function getTabStream(width, height, framerate) {
     const response = await new Promise((resolve) =>
@@ -92,59 +88,61 @@
     return buf.buffer;
   }
 
-  function startVideoSender(ws, framerate) {
-    const frameIntervalMs = 1000 / framerate;
-    let latestFrame = null;
-    let droppedDueToBackpressure = 0;
-
-    const timer = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN) {
-        clearInterval(timer);
-        return;
-      }
-      if (!latestFrame) return;
-      if (ws.bufferedAmount > latestFrame.byteLength * 2) {
-        droppedDueToBackpressure++;
-        if (droppedDueToBackpressure === 1 || droppedDueToBackpressure % 25 === 0) {
-          console.warn(`[capture] WS video backpressure — holding latest frame (count=${droppedDueToBackpressure})`);
-        }
-        return;
-      }
-      ws.send(latestFrame);
-    }, frameIntervalMs);
-
-    ws.addEventListener("close", () => clearInterval(timer), { once: true });
-    return {
-      update(frameBuffer) {
-        latestFrame = frameBuffer;
-      },
-      stop() {
-        clearInterval(timer);
-      },
-    };
-  }
-
-  // Pump VideoFrames → WS until the WS closes or the track ends.
-  // The sender emits exactly FRAMERATE frames/second, duplicating the newest
-  // rendered frame as needed. That keeps ffmpeg's rawvideo frame-count clock
-  // aligned with wall time instead of browser rendering cadence.
+  // Pump VideoFrames → WS, capping outflow at the target framerate. The
+  // browser's compositor can deliver frames faster than the requested rate
+  // (especially with active CSS animations or playing video elements), but
+  // the relay's fifo to ffmpeg drains at exactly `framerate`. Throttle here
+  // rather than letting the WS buffer and TCP backpressure handle it
+  // chaotically downstream.
   async function pumpVideo(track, ws, mySession, framerate) {
     const proc = new MediaStreamTrackProcessor({ track });
     const reader = proc.readable.getReader();
-    const sender = startVideoSender(ws, framerate);
+    // Browser compositor can produce frames faster than `framerate` (e.g.
+    // when forceFrames' rAF runs at 60 Hz), but the relay's fifo to ffmpeg
+    // can only drain at `framerate`. Drop overshoots cleanly at intake
+    // rather than letting them queue and chaotically drop at the WS buffer.
+    const minIntervalMs = 1000 / framerate;
+    let nextSendTime = 0;
+    let droppedRate = 0;
+    let droppedBackpressure = 0;
+    let framesReceived = 0;
+    let framesSent = 0;
+    let lastReport = performance.now();
     try {
       while (mySession === videoSession && ws.readyState === WebSocket.OPEN) {
         const { value: frame, done } = await reader.read();
         if (done) break;
+        framesReceived++;
         try {
+          const now = performance.now();
+          // Allow a half-interval of slack so a frame arriving 5ms early
+          // isn't dropped (browser delivery isn't perfectly metronomic).
+          if (now + minIntervalMs / 2 < nextSendTime) {
+            droppedRate++;
+            continue;
+          }
+          // We're past the rate gate — claim this slot regardless of whether
+          // the send below succeeds. Otherwise a backpressure drop leaves
+          // nextSendTime frozen and the next 80 frames all sail through the
+          // rate check and slam into backpressure again.
+          nextSendTime = Math.max(now + minIntervalMs, nextSendTime + minIntervalMs);
           const ab = await packI420(frame);
-          sender.update(ab);
+          if (ws.bufferedAmount > ab.byteLength * 4) {
+            droppedBackpressure++;
+            continue;
+          }
+          ws.send(ab);
+          framesSent++;
         } finally {
           frame.close();
         }
+        const now = performance.now();
+        if (now - lastReport >= 1000) {
+          console.log(`[capture] video rate: rcv=${framesReceived}/s sent=${framesSent}/s rate-drop=${droppedRate} bp-drop=${droppedBackpressure}`);
+          framesReceived = 0; framesSent = 0; droppedRate = 0; droppedBackpressure = 0; lastReport = now;
+        }
       }
     } finally {
-      sender.stop();
       try { reader.cancel(); } catch (e) {}
     }
   }

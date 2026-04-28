@@ -4,7 +4,7 @@ services:
     environment:
       - URL=https://www.google.com
       - OUTPUT=udp://239.0.0.1:1234
-      - PROFILE=pal                # pal | ntsc | 720p | 1080p | hls
+      - PROFILE=pal                # pal | ntsc | 720p | 1080p
       # - WIDTH=720                # Override profile resolution
       # - HEIGHT=576
       # - FRAMERATE=25
@@ -15,7 +15,7 @@ services:
       # - PROGRAMME_DESC=
       # - STREAM_URL=              # Override auto-derived stream URL in playlist
     ports:
-      - "9000:9000"               # HTTP + WebSocket (guide.xml, playlist.m3u, health)
-      # - "9876:9876"             # Uncomment for TCP stream output
+      - "9000:9000"               # IPTV metadata + WS ingest (guide.xml, playlist.m3u, health)
+      # - "9876:9876"             # Uncomment when OUTPUT=tcp://0.0.0.0:9876
     # Uncomment for host networking (needed for UDP multicast in some setups):
     # network_mode: host
