@@ -9,6 +9,7 @@ WS_PORT="${WS_PORT:-9000}"
 WIDTH="${WIDTH:-720}"
 HEIGHT="${HEIGHT:-576}"
 FRAMERATE="${FRAMERATE:-25}"
+CAPTURE_MODE="${CAPTURE_MODE:-webm}"
 
 echo "[trigger] waiting for Chrome CDP on port $CDP_PORT..."
 
@@ -80,7 +81,8 @@ async def trigger():
                         port: ${WS_PORT},
                         width: ${WIDTH},
                         height: ${HEIGHT},
-                        framerate: ${FRAMERATE}
+                        framerate: ${FRAMERATE},
+                        captureMode: '${CAPTURE_MODE}'
                     }, '*');
                     'capture triggered';
                 """,

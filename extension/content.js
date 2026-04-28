@@ -1,16 +1,21 @@
-// Capture flow:
-//   chrome.tabCapture → MediaStream (audio + video tracks)
-//   MediaStreamTrackProcessor(video) → VideoFrame stream → I420 bytes → WS /ingest/video
-//   MediaStreamTrackProcessor(audio) → AudioData stream → f32le bytes → WS /ingest/audio
+// Capture flow (default: webm — muxed A+V with correct relative timestamps):
+//   chrome.tabCapture → MediaStream → MediaRecorder(WebM) → WS /ingest/webm
 //
-// Wire protocol (per-message, no inner framing):
-//   video: width*height*3/2 bytes, planes Y U V concatenated (I420)
-//   audio: variable-length f32le interleaved stereo at 44.1 kHz
+// Legacy raw mode (CAPTURE_MODE=raw + relay INGEST_MODE=raw): two sockets with no
+// shared timeline — will drift under backpressure / frame drops; not recommended
+// for A/V sync tests.
+//
+// Wire protocol:
+//   webm: binary messages concatenated in order = one WebM bytestream
+//   video: width*height*3/2 bytes I420 per message → /ingest/video
+//   audio: f32le PCM chunks → /ingest/audio
 
 (function () {
   let stream = null;
+  let captureStarting = false;
   let videoSession = 0;
   let audioSession = 0;
+  let webmSession = 0;
 
   function hideScrollbars() {
     const style = document.createElement("style");
@@ -171,25 +176,135 @@
     return interleaved.buffer;
   }
 
-  async function pumpAudio(track, ws, mySession) {
-    const proc = new MediaStreamTrackProcessor({ track });
-    const reader = proc.readable.getReader();
+  // One MediaStreamTrackProcessor per (re)connect. We must not open a probe
+  // reader and then a second processor: Chromium may split or duplicate
+  // AudioData between consumers, which sounds like dropouts / runaway A/V skew.
+  async function pumpAudioReader(reader, ws, mySession, firstChunk) {
+    let chunk = firstChunk;
     try {
       while (mySession === audioSession && ws.readyState === WebSocket.OPEN) {
-        const { value: chunk, done } = await reader.read();
-        if (done) break;
+        if (!chunk) {
+          const { value: next, done } = await reader.read();
+          if (done) break;
+          chunk = next;
+        }
+        const toSend = chunk;
+        chunk = null;
         try {
-          ws.send(copyAudioToInterleavedF32(chunk));
+          ws.send(copyAudioToInterleavedF32(toSend));
         } finally {
-          chunk.close();
+          toSend.close();
         }
       }
     } finally {
-      try { reader.cancel(); } catch (e) {}
+      if (chunk) {
+        try {
+          chunk.close();
+        } catch (e) {}
+      }
+      try {
+        reader.cancel();
+      } catch (e) {}
     }
   }
 
   // (Re)open the video WS and pump until it closes; then loop again.
+  function pickWebmMimeType() {
+    const candidates = [
+      "video/webm;codecs=vp8,opus",
+      "video/webm;codecs=vp9,opus",
+      "video/webm",
+    ];
+    for (const c of candidates) {
+      if (MediaRecorder.isTypeSupported(c)) return c;
+    }
+    return "";
+  }
+
+  function waitForWebSocketDrain(ws, mySession, chunkLen) {
+    // Never drop WebM fragments — missing bytes break demux and sound like audio
+    // dropouts. Wait until the browser send buffer has headroom (no drain event
+    // in the WebSocket API, so we poll).
+    const ceiling = Math.min(Math.max(chunkLen * 48, 512 * 1024), 12 * 1024 * 1024);
+    return new Promise((resolve) => {
+      function tick() {
+        if (mySession !== webmSession || ws.readyState !== WebSocket.OPEN) {
+          resolve();
+          return;
+        }
+        if (ws.bufferedAmount <= ceiling) {
+          resolve();
+          return;
+        }
+        setTimeout(tick, 4);
+      }
+      tick();
+    });
+  }
+
+  async function webmLoop(stream, relayHost, timesliceMs) {
+    const mime = pickWebmMimeType();
+    if (!mime) {
+      console.error("[capture] no WebM codec supported by MediaRecorder");
+      return;
+    }
+    let sendChain = Promise.resolve();
+    while (stream.active) {
+      const mySession = ++webmSession;
+      const ws = await openWS(`ws://${relayHost}/ingest/webm`);
+      console.log("[capture] webm WS connected —", mime);
+      ws.addEventListener("close", () =>
+        console.log("[capture] webm WS closed — will reconnect")
+      );
+
+      const recorder = new MediaRecorder(stream, { mimeType: mime });
+      recorder.addEventListener("error", (e) =>
+        console.error("[capture] MediaRecorder error:", e.error)
+      );
+      recorder.addEventListener("dataavailable", (e) => {
+        if (mySession !== webmSession || ws.readyState !== WebSocket.OPEN) return;
+        if (!e.data || e.data.size === 0) return;
+        sendChain = sendChain
+          .then(() => e.data.arrayBuffer())
+          .then(async (ab) => {
+            if (mySession !== webmSession || ws.readyState !== WebSocket.OPEN) return;
+            await waitForWebSocketDrain(ws, mySession, ab.byteLength);
+            if (mySession !== webmSession || ws.readyState !== WebSocket.OPEN) return;
+            ws.send(ab);
+          })
+          .catch((err) => console.warn("[capture] webm chunk error:", err));
+      });
+
+      try {
+        recorder.start(timesliceMs);
+      } catch (e) {
+        console.error("[capture] MediaRecorder.start failed:", e);
+        try {
+          ws.close();
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+
+      await new Promise((resolve) => {
+        ws.addEventListener("close", resolve, { once: true });
+      });
+
+      try {
+        if (recorder.state !== "inactive") recorder.stop();
+      } catch (e) {}
+      try {
+        await sendChain;
+      } catch (_) {}
+      sendChain = Promise.resolve();
+      if (!stream.active) {
+        console.warn("[capture] stream inactive — exiting webm loop");
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
   async function videoLoop(track, vURL, framerate) {
     while (true) {
       const mySession = ++videoSession;
@@ -207,13 +322,36 @@
     }
   }
 
-  async function audioLoop(track, aURL) {
+  async function audioLoop(track, relayHost) {
     while (true) {
       const mySession = ++audioSession;
+      const proc = new MediaStreamTrackProcessor({ track });
+      const reader = proc.readable.getReader();
+      const { value: firstChunk, done } = await reader.read();
+      if (done || !firstChunk) {
+        try {
+          reader.cancel();
+        } catch (e) {}
+        if (track.readyState === "ended") {
+          console.warn("[capture] audio track ended — bailing out of loop");
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      const params = {
+        sampleRate: firstChunk.sampleRate,
+        channels: firstChunk.numberOfChannels,
+        format: firstChunk.format || "unknown",
+      };
+      console.log(
+        `[capture] audio format: ${params.format} ${params.sampleRate}Hz ${params.channels}ch`
+      );
+      const aURL = `ws://${relayHost}/ingest/audio?sr=${params.sampleRate}&ch=${params.channels}`;
       const ws = await openWS(aURL);
-      console.log("[capture] audio WS connected");
+      console.log(`[capture] audio WS connected — ${params.sampleRate}Hz ${params.channels}ch`);
       ws.addEventListener("close", () => console.log("[capture] audio WS closed — will reconnect"));
-      await pumpAudio(track, ws, mySession);
+      await pumpAudioReader(reader, ws, mySession, firstChunk);
       if (track.readyState === "ended") {
         console.warn("[capture] audio track ended — bailing out of loop");
         return;
@@ -222,14 +360,36 @@
     }
   }
 
-  async function startCapture({ width, height, framerate, relayHost }) {
+  async function startCapture({ width, height, framerate, relayHost, captureMode }) {
+    if (captureStarting || (stream && stream.active)) {
+      console.warn("[capture] capture already active; ignoring duplicate start command");
+      return;
+    }
+
+    captureStarting = true;
     hideScrollbars();
     forceFrames();
     try {
       stream = await getTabStream(width, height, framerate);
     } catch (e) {
       console.error("[capture] tabCapture failed, retrying in 2s:", e);
-      setTimeout(() => startCapture({ width, height, framerate, relayHost }), 2000);
+      captureStarting = false;
+      setTimeout(
+        () => startCapture({ width, height, framerate, relayHost, captureMode }),
+        2000
+      );
+      return;
+    }
+    captureStarting = false;
+
+    const mode = captureMode === "raw" ? "raw" : "webm";
+    if (mode === "webm") {
+      console.log(
+        `[capture] MediaRecorder WebM → ws://${relayHost}/ingest/webm (${width}x${height}@${framerate} tab capture)`
+      );
+      webmLoop(stream, relayHost, 100).catch((e) =>
+        console.error("[capture] webmLoop fatal:", e)
+      );
       return;
     }
 
@@ -237,18 +397,17 @@
     const aTrack = stream.getAudioTracks()[0];
 
     const vURL = `ws://${relayHost}/ingest/video?w=${width}&h=${height}&fr=${framerate}`;
-    const aURL = `ws://${relayHost}/ingest/audio?sr=44100&ch=2`;
 
-    console.log(`[capture] starting pumps — ${width}x${height}@${framerate}fps → ws://${relayHost}/ingest/*`);
+    console.log(`[capture] raw ingest — ${width}x${height}@${framerate}fps → ws://${relayHost}/ingest/*`);
 
     videoLoop(vTrack, vURL, framerate).catch((e) => console.error("[capture] videoLoop fatal:", e));
-    audioLoop(aTrack, aURL).catch((e) => console.error("[capture] audioLoop fatal:", e));
+    audioLoop(aTrack, relayHost).catch((e) => console.error("[capture] audioLoop fatal:", e));
   }
 
   // The trigger-capture.sh script posts CAPTURE_COMMAND with at minimum:
   //   { type: 'CAPTURE_COMMAND', command: 'start', width, height, framerate }
   // and either `relayHost` (preferred new shape, "host:port") or `port`
-  // (legacy shape from the MediaRecorder era — we accept both for now).
+  // (legacy shape — we accept both). Optional `captureMode`: "webm" (default) or "raw".
   window.addEventListener("message", (event) => {
     if (
       event.data &&
@@ -261,7 +420,8 @@
       const relayHost =
         event.data.relayHost ||
         (event.data.port ? `127.0.0.1:${event.data.port}` : "127.0.0.1:9000");
-      startCapture({ width, height, framerate, relayHost });
+      const captureMode = String(event.data.captureMode || "webm").toLowerCase();
+      startCapture({ width, height, framerate, relayHost, captureMode });
     }
   });
 })();

@@ -3,7 +3,7 @@ const assert = require("node:assert");
 const http = require("node:http");
 const { Writable } = require("node:stream");
 const WebSocket = require("ws");
-const { mountIngest } = require("../ingest.js");
+const { mountIngest, mountIngestWebm } = require("../ingest.js");
 
 function collector() {
   const chunks = [];
@@ -67,21 +67,69 @@ test("video WS connection is rejected on dimension mismatch", async () => {
   await new Promise((r) => httpServer.close(r));
 });
 
-test("audio WS connection is rejected on sample-rate mismatch", async () => {
+test("audio WS connection accepts Chrome-reported sample rate and channel count", async () => {
   const v = collector();
   const a = collector();
+  let audioParams = null;
   const httpServer = http.createServer();
-  mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25, sampleRate: 44100, channels: 2 } });
+  mountIngest(httpServer, {
+    videoSink: v.sink,
+    audioSink: a.sink,
+    expected: { width: 720, height: 576, framerate: 25 },
+    onAudioParams(params) {
+      audioParams = params;
+    },
+  });
   await new Promise((r) => httpServer.listen(0, r));
   const port = httpServer.address().port;
 
   const aws = new WebSocket(`ws://127.0.0.1:${port}/ingest/audio?sr=48000&ch=2`);
+  await new Promise((r) => aws.once("open", r));
+  assert.deepStrictEqual(audioParams, { sampleRate: 48000, channels: 2 });
+
+  aws.close();
+  await new Promise((r) => httpServer.close(r));
+});
+
+test("audio WS connection is rejected on invalid sample rate", async () => {
+  const v = collector();
+  const a = collector();
+  const httpServer = http.createServer();
+  mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25 } });
+  await new Promise((r) => httpServer.listen(0, r));
+  const port = httpServer.address().port;
+
+  const aws = new WebSocket(`ws://127.0.0.1:${port}/ingest/audio?sr=0&ch=2`);
   aws.on("error", () => {});
   await new Promise((r) => aws.once("unexpected-response", (_req, res) => {
     assert.strictEqual(res.statusCode, 400);
     r();
   }));
 
+  await new Promise((r) => httpServer.close(r));
+});
+
+test("webm WS messages are forwarded to the stream sink in order", async () => {
+  const c = collector();
+  const httpServer = http.createServer();
+  mountIngestWebm(httpServer, {
+    streamSink: c.sink,
+    onBeforeUpgrade: async () => {},
+  });
+  await new Promise((r) => httpServer.listen(0, r));
+  const port = httpServer.address().port;
+
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ingest/webm`);
+  await new Promise((r) => ws.once("open", r));
+
+  ws.send(Buffer.from([1, 2, 3]));
+  ws.send(Buffer.from([4, 5]));
+
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.deepStrictEqual(Buffer.concat(c.chunks), Buffer.from([1, 2, 3, 4, 5]));
+
+  ws.close();
   await new Promise((r) => httpServer.close(r));
 });
 

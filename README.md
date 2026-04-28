@@ -10,30 +10,28 @@ This tool produces an **MPEG-TS stream** from a captured web page and pushes it 
 
 ## How it works
 
+**Default path (`INGEST_MODE=webm`):** one muxed **WebM** stream (VP8/VP9 + Opus) so audio and video share Chrome’s timestamps — good A/V sync.
+
 ```
 Chromium (headless, with capture extension)
     │
-    ├── chrome.tabCapture → MediaStream (audio + video tracks)
-    ├── MediaStreamTrackProcessor(video) → I420 frames
-    └── MediaStreamTrackProcessor(audio) → f32le PCM
+    ├── chrome.tabCapture → MediaStream
+    └── MediaRecorder → WebM fragments
               │
-              └── two WebSockets (binary, ~25 fps + ~44.1 kHz)
+              └── WebSocket /ingest/webm (ordered bytestream)
                         │
                         ▼
-                  Relay (Node.js)
-                        │
-                        └── named pipes → FFmpeg → MPEG-TS
-                                            │
-                                            └── OUTPUT (UDP / RTP / TCP / file)
+                  Relay → FFmpeg stdin → MPEG-TS → OUTPUT
 ```
 
-1. **Chromium** launches headless with a built-in extension that captures the active tab's audio and video using `chrome.tabCapture`.
-2. The **content script** uses `MediaStreamTrackProcessor` to get raw `VideoFrame` and `AudioData` objects, packs them as I420 + interleaved f32le, and ships them over two WebSocket connections.
-3. The **relay** writes each WS message into a named pipe; **FFmpeg** reads the two pipes as `-f rawvideo` + `-f f32le` and encodes to MPEG-TS.
-4. FFmpeg pushes MPEG-TS to the configured `OUTPUT` (UDP, RTP, TCP listener, or file).
-5. **Supervisord** manages all processes and restarts them on failure.
+**Legacy path (`INGEST_MODE=raw` + `CAPTURE_MODE=raw`):** separate **I420** video and **PCM** audio sockets into named pipes. No shared muxed clock — can drift under load; mainly for debugging or special cases.
 
-The relay also serves IPTV integration endpoints (XMLTV guide, M3U playlist, health) on `WS_PORT` for use by IPTV gateways.
+1. **Chromium** captures the active tab via `chrome.tabCapture` (extension broker).
+2. **content.js** sends **WebM** chunks to `ws://…/ingest/webm`, or in raw mode **I420 + f32le** to `/ingest/video` and `/ingest/audio`.
+3. **Relay** feeds **FFmpeg** (stdin for WebM, or fifos for raw); FFmpeg encodes to MPEG-TS and writes **`OUTPUT`** (UDP, RTP, TCP listener, or file) directly.
+4. **Supervisord** manages relay, Chrome, and the one-shot capture trigger.
+
+The relay also serves IPTV endpoints (XMLTV, M3U, health) on `WS_PORT`.
 
 ## Quick start
 
@@ -47,8 +45,10 @@ docker run --rm -p 9876:9876 \
   webpagestreamer
 
 # Then in another terminal:
-ffplay -f mpegts tcp://127.0.0.1:9876
+ffplay -fflags nobuffer -flags low_delay -f mpegts tcp://127.0.0.1:9876
 ```
+
+If you hear brief pitch wobble in **ffplay**, try **VLC** or `ffplay -sync video` / `ffplay -sync audio` — the transport is usually fine; players disagree on how hard to chase A/V on live MPEG-TS.
 
 ### Test script
 
@@ -70,6 +70,8 @@ DURATION=60 ./test.sh
 | `FRAMERATE` | from profile             | Frames per second                        |
 | `WS_PORT`   | `9000`                   | Port for IPTV metadata endpoints + WS ingest |
 | `CDP_PORT`  | `9222`                   | Chrome DevTools Protocol port (internal) |
+| `INGEST_MODE` | `webm`               | Relay ingest: `webm` (muxed, recommended) or `raw` (dual I420+PCM) |
+| `CAPTURE_MODE` | (same as `INGEST_MODE`) | Extension must match relay (`start.sh` sets both) |
 
 Encoding overrides: `VIDEO_CODEC`, `AUDIO_CODEC`, `VIDEO_BITRATE`, `AUDIO_BITRATE`, `SAR`, `INTERLACED`, `B_FRAMES` all override the profile defaults.
 
@@ -154,7 +156,7 @@ For H.264-codec consumers, also set `-e PROFILE=720p` (or override with `VIDEO_C
 PAL profile (`PROFILE=pal`):
 
 - **Video**: MPEG-2 (mpeg2video), 5 Mbps, progressive, SAR 12:11 (PAL 4:3)
-- **Audio**: MPEG-2 Layer 2 (MP2), 256 kbps, 48 kHz stereo (resampled from browser's 44.1 kHz)
+- **Audio**: MPEG-2 Layer 2 (MP2), 256 kbps, 48 kHz stereo (WebM path: Opus in → encode to MP2; raw path: PCM rate negotiated from Chrome)
 - **GOP**: ~0.5 s (fast channel joining)
 - **B-frames**: 0 (set `B_FRAMES=2` for better compression at cost of latency)
 
@@ -170,13 +172,13 @@ For broadcast PAL specifically (interlaced 25i), set `INTERLACED=true`. Default 
 ├── supervisord.conf
 ├── trigger-capture.sh      # CDP-driven capture trigger
 ├── relay/
-│   ├── server.js           # WS ingest → fifos → ffmpeg → OUTPUT
-│   ├── ingest.js           # WS endpoints for raw video + audio
+│   ├── server.js           # WS ingest → FFmpeg (WebM stdin or raw fifos) → OUTPUT
+│   ├── ingest.js           # /ingest/webm and/or /ingest/video + /ingest/audio
 │   └── package.json
 └── extension/
     ├── manifest.json
     ├── background.js       # tabCapture stream-ID broker
-    └── content.js          # MediaStreamTrackProcessor → WebSocket
+    └── content.js          # MediaRecorder (WebM) or raw TrackProcessor pumps
 ```
 
 ## Troubleshooting
@@ -196,6 +198,13 @@ For broadcast PAL specifically (interlaced 25i), set `INTERLACED=true`. Default 
   ```bash
   -e URL="http://host.docker.internal:3000"
   ```
+
+**FFmpeg / Chrome log noise**
+- One-line `mpeg2video … impossible bitrate constraints` at startup often appears even when the encode is healthy; check that output video is **25 fps** (or your `FRAMERATE`) and `speed≈1` in progress lines.
+- DBus, ALSA, GCM, Vulkan messages from headless Chrome in Docker are usually harmless.
+
+**A/V sync or pitch in ffplay**
+- Prefer the default **WebM** ingest for sync tests. If ffplay still sounds odd, try VLC or another player, or `ffplay -sync video`.
 
 ## License
 

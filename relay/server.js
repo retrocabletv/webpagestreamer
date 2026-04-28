@@ -1,7 +1,6 @@
-// Relay server: ingests raw I420 video frames + f32le audio chunks from the
-// Chrome extension over two WebSockets (see ./ingest.js for the wire protocol),
-// fans them through named pipes into ffmpeg, which encodes to MPEG-TS and
-// pushes to the configured OUTPUT destination.
+// Relay server: ingests from the Chrome extension and feeds FFmpeg → MPEG-TS → OUTPUT.
+// Default (INGEST_MODE=webm): muxed WebM on /ingest/webm → FFmpeg stdin.
+// Legacy (INGEST_MODE=raw): I420 + f32le PCM on two sockets → named pipes (see ingest.js).
 //
 // OUTPUT modes (all native ffmpeg outputs — no custom Node networking):
 //   udp://host:port   — UDP / multicast (raw MPEG-TS). Standard for IPTV.
@@ -20,7 +19,7 @@
 
 const http = require("http");
 const { spawn, execFileSync } = require("child_process");
-const { mountIngest } = require("./ingest.js");
+const { mountIngest, mountIngestWebm } = require("./ingest.js");
 const fs = require("fs");
 const url = require("url");
 
@@ -35,6 +34,7 @@ const STREAM_URL = process.env.STREAM_URL || "";
 
 const VIDEO_FIFO = "/tmp/video.fifo";
 const AUDIO_FIFO = "/tmp/audio.fifo";
+const FFMPEG_READY_TIMEOUT_MS = 30000;
 
 // ---------------------------------------------------------------------------
 // Encoding profiles — each bundles resolution, codec, and format defaults
@@ -90,18 +90,28 @@ const SAR = process.env.SAR || baseProfile.sar;
 const INTERLACED = process.env.INTERLACED
   ? process.env.INTERLACED === "true"
   : baseProfile.interlaced;
+// webm = single muxed MediaRecorder stream (A/V timestamps from Chrome). raw =
+// legacy dual WebSocket I420 + PCM (no shared timeline — drifts under load).
+const INGEST_MODE = (process.env.INGEST_MODE || "webm").toLowerCase();
 let ffmpeg = null;
 let ffmpegReady = false;
 let videoIngestConnected = false;
 let audioIngestConnected = false;
+let webmIngestConnected = false;
 let videoFifoWriter = null;
 let audioFifoWriter = null;
+let audioInput = null;
+let ffmpegRestartTimer = null;
+let videoWriterReady = false;
+let audioWriterReady = false;
+let videoWriterReadyWaiters = [];
+let audioWriterReadyWaiters = [];
 
 // ---------------------------------------------------------------------------
 // FFmpeg — encodes raw I420 video + f32le audio to MPEG-TS on stdout
 // ---------------------------------------------------------------------------
 
-function buildFFmpegArgs() {
+function buildFFmpegArgs(inputAudio) {
   const gop = String(Math.round(parseFloat(FRAMERATE) / 2));
   const args = [
     "-fflags", "+genpts",
@@ -118,10 +128,12 @@ function buildFFmpegArgs() {
     "-thread_queue_size", "64",
     "-i", VIDEO_FIFO,
 
-    // Raw f32le audio pipe at 44.1 kHz. Encoder's -ar 48000 below resamples.
+    // Raw f32le audio pipe using the exact rate/channel count Chrome reports
+    // from AudioData. Raw PCM has no headers, so this must match the browser
+    // capture stream or ffmpeg will play audio at the wrong speed.
     "-f", "f32le",
-    "-ar", "44100",
-    "-ac", "2",
+    "-ar", String(inputAudio.sampleRate),
+    "-ac", String(inputAudio.channels),
     "-thread_queue_size", "64",
     "-i", AUDIO_FIFO,
 
@@ -143,12 +155,9 @@ function buildFFmpegArgs() {
   const fieldTag = INTERLACED ? "tff" : "prog";
   args.push("-vf", `setsar=${SAR},setfield=${fieldTag}`);
 
-  // Output audio at 48 kHz regardless of input — ffmpeg resamples 44100→48000.
-  // aresample=async=1000 continuously stretches/compresses audio (up to 1000
-  // samples per chunk) to track the video's clock. Without this the two
-  // declared rates (44.1 kHz audio, 25 fps video) drift relative to each
-  // other because the browser's compositor isn't a metronome — measured 2%
-  // divergence over 10 s with the BBC sync test.
+  // Output audio at 48 kHz for MPEG-TS/broadcast compatibility. The input
+  // side above is negotiated from Chrome, so this is a normal resample rather
+  // than a guess about the browser's native capture clock.
   args.push("-c:a", AUDIO_CODEC, "-b:a", AUDIO_BITRATE, "-ar", "48000", "-ac", "2");
   args.push("-af", "aresample=async=1000");
 
@@ -168,6 +177,194 @@ function buildFFmpegArgs() {
   return args;
 }
 
+function buildFFmpegArgsWebm() {
+  const gop = String(Math.round(parseFloat(FRAMERATE) / 2));
+  const fieldTag = INTERLACED ? "tff" : "prog";
+  // MediaRecorder WebM often reports a bogus time base (e.g. 1k tbn); without
+  // forcing CFR here FFmpeg can invent ~240fps output and mpeg2video then hits
+  // "impossible bitrate constraints" / rc buffer underflow at 5 Mbit/s.
+  const vf = `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=${FRAMERATE},setsar=${SAR},setfield=${fieldTag}`;
+  const args = [
+    "-hide_banner",
+    // Do not discardcorrupt on live WebM — can drop real audio after any glitch.
+    "-fflags", "+genpts",
+    "-analyzeduration", "10000000",
+    "-probesize", "10000000",
+    "-thread_queue_size", "512",
+    "-f", "webm",
+    "-i", "-",
+    "-map", "0:v:0",
+    "-map", "0:a:0",
+    "-vf", vf,
+    "-c:v", VIDEO_CODEC,
+    "-b:v", VIDEO_BITRATE,
+    "-maxrate", VIDEO_BITRATE,
+    // mpeg2video VBV: bufsize << maxrate triggers "impossible bitrate constraints"
+    // and unstable RC; match buffer to peak for fewer spikes into audio starvation.
+    "-bufsize", VIDEO_BITRATE,
+    "-pix_fmt", "yuv420p",
+    "-g", gop,
+    "-bf", B_FRAMES,
+    "-fps_mode", "cfr",
+  ];
+
+  if (INTERLACED) args.push("-flags", "+ilme+ildct");
+  if (VIDEO_CODEC === "libx264") args.push("-preset", "veryfast", "-tune", "zerolatency");
+
+  args.push(
+    "-c:a", AUDIO_CODEC,
+    "-b:a", AUDIO_BITRATE,
+    "-ar", "48000",
+    "-ac", "2",
+    // WebM A/V is already muxed at 48 kHz — do not use aresample=async here; it
+    // time-stretches audio and causes audible “pitch wobble” when compensating.
+    "-flush_packets", "1",
+    "-f", "mpegts",
+    "-mpegts_flags", "+resend_headers",
+    "-muxdelay", "0",
+    "-muxpreload", "0.04",
+    OUTPUT,
+  );
+
+  return args;
+}
+
+function killWebmFfmpegProcess() {
+  if (!ffmpeg) return;
+  try {
+    ffmpeg.stdin.end();
+  } catch {}
+  try {
+    ffmpeg.kill("SIGTERM");
+  } catch {}
+  ffmpeg = null;
+  ffmpegReady = false;
+}
+
+function startWebmFFmpeg() {
+  if (ffmpeg) return;
+  if (ffmpegRestartTimer) {
+    clearTimeout(ffmpegRestartTimer);
+    ffmpegRestartTimer = null;
+  }
+
+  const args = buildFFmpegArgsWebm();
+
+  console.log(`[relay] starting FFmpeg (webm ingest) → ${OUTPUT} (profile: ${PROFILE})`);
+  console.log(`[relay]   in: WebM on stdin → ${VIDEO_CODEC} + ${AUDIO_CODEC} @ 48 kHz stereo`);
+
+  ffmpeg = spawn("ffmpeg", args, {
+    stdio: ["pipe", "ignore", "pipe"],
+  });
+
+  ffmpegReady = true;
+  ffmpeg.stdin.on("error", () => {});
+
+  ffmpeg.stderr.on("data", (data) => {
+    const line = data.toString().trim();
+    if (line) {
+      if (line.startsWith("frame=") || line.startsWith("size=")) {
+        if (Math.random() < 0.01) {
+          console.log(`[ffmpeg] ${line}`);
+        }
+      } else {
+        console.log(`[ffmpeg] ${line}`);
+      }
+    }
+  });
+
+  ffmpeg.on("error", (err) => {
+    console.error("[relay] FFmpeg process error:", err.message);
+    ffmpegReady = false;
+    ffmpeg = null;
+  });
+
+  ffmpeg.on("exit", (code, signal) => {
+    console.log(`[relay] FFmpeg exited: code=${code} signal=${signal}`);
+    ffmpeg = null;
+    ffmpegReady = false;
+  });
+}
+
+async function prepareWebmIngest() {
+  killWebmFfmpegProcess();
+  await new Promise((resolve) => setImmediate(resolve));
+  startWebmFFmpeg();
+}
+
+function webmStdinSink() {
+  return {
+    write(chunk) {
+      if (!ffmpeg || !ffmpeg.stdin || ffmpeg.stdin.destroyed) return true;
+      return ffmpeg.stdin.write(chunk);
+    },
+    once(event, cb) {
+      if (!ffmpeg || !ffmpeg.stdin || ffmpeg.stdin.destroyed) {
+        setImmediate(cb);
+        return;
+      }
+      ffmpeg.stdin.once(event, cb);
+    },
+  };
+}
+
+function sameAudioInput(a, b) {
+  return Boolean(a && b && a.sampleRate === b.sampleRate && a.channels === b.channels);
+}
+
+function audioInputLabel(inputAudio) {
+  return `${inputAudio.sampleRate}Hz ${inputAudio.channels}ch`;
+}
+
+function waitForWriterReady(kind) {
+  const ready = kind === "video" ? videoWriterReady : audioWriterReady;
+  if (ready) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const waiters = kind === "video" ? videoWriterReadyWaiters : audioWriterReadyWaiters;
+    const waiter = {
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        if (kind === "video") {
+          videoWriterReadyWaiters = videoWriterReadyWaiters.filter((item) => item !== waiter);
+        } else {
+          audioWriterReadyWaiters = audioWriterReadyWaiters.filter((item) => item !== waiter);
+        }
+        reject(new Error(`timed out waiting for ${kind} fifo writer to become ready`));
+      }, FFMPEG_READY_TIMEOUT_MS),
+    };
+    waiters.push(waiter);
+  });
+}
+
+function resolveWriterReadyWaiters(kind) {
+  const waiters = kind === "video" ? videoWriterReadyWaiters : audioWriterReadyWaiters;
+  if (kind === "video") {
+    videoWriterReadyWaiters = [];
+  } else {
+    audioWriterReadyWaiters = [];
+  }
+  for (const waiter of waiters) {
+    clearTimeout(waiter.timer);
+    waiter.resolve();
+  }
+}
+
+function destroyFifoWriters() {
+  if (videoFifoWriter) {
+    try { videoFifoWriter.destroy(); } catch {}
+  }
+  if (audioFifoWriter) {
+    try { audioFifoWriter.destroy(); } catch {}
+  }
+  videoFifoWriter = null;
+  audioFifoWriter = null;
+  videoWriterReady = false;
+  audioWriterReady = false;
+  ffmpegReady = false;
+}
+
 function setupPipes() {
   for (const fifo of [VIDEO_FIFO, AUDIO_FIFO]) {
     try { fs.unlinkSync(fifo); } catch {}
@@ -176,16 +373,26 @@ function setupPipes() {
 }
 
 function startFFmpeg() {
+  if (!audioInput) {
+    console.log("[relay] waiting for Chrome audio format before starting FFmpeg");
+    return;
+  }
+  if (ffmpeg) return;
+  if (ffmpegRestartTimer) {
+    clearTimeout(ffmpegRestartTimer);
+    ffmpegRestartTimer = null;
+  }
+
   // Recreate the named pipes on every spawn. The kernel pipe buffer can
   // hold partial frames from a dead ffmpeg; reading them as if fresh would
   // misalign rawvideo. unlink+mkfifo gives us a pristine fifo each life.
   setupPipes();
 
-  const args = buildFFmpegArgs();
+  const args = buildFFmpegArgs(audioInput);
 
   console.log(`[relay] starting FFmpeg → ${OUTPUT} (profile: ${PROFILE})`);
   console.log(`[relay]   ${VIDEO_CODEC} ${WIDTH}x${HEIGHT}@${FRAMERATE}fps SAR ${SAR}${INTERLACED ? " interlaced" : ""}`);
-  console.log(`[relay]   ${AUDIO_CODEC} ${AUDIO_BITRATE} 48kHz stereo (in: 44.1 kHz)`);
+  console.log(`[relay]   ${AUDIO_CODEC} ${AUDIO_BITRATE} 48kHz stereo (in: ${audioInputLabel(audioInput)})`);
 
   ffmpeg = spawn("ffmpeg", args, {
     stdio: ["ignore", "ignore", "pipe"],
@@ -193,16 +400,32 @@ function startFFmpeg() {
 
   // Open the fifo writers asynchronously so ffmpeg has a chance to open the
   // read end first; otherwise createWriteStream() blocks waiting for a reader.
-  // ffmpegReady is set inside this callback so writes from the ingest WS
-  // can't race ahead of valid writers.
+  // ffmpegReady is set only after both FIFO write ends are open. Video
+  // upgrades wait for the video writer; audio can connect earlier and starts
+  // writing once ffmpeg reaches the audio fifo.
   setImmediate(() => {
-    if (videoFifoWriter) { try { videoFifoWriter.destroy(); } catch {} }
-    if (audioFifoWriter) { try { audioFifoWriter.destroy(); } catch {} }
+    destroyFifoWriters();
     videoFifoWriter = fs.createWriteStream(VIDEO_FIFO, { highWaterMark: VIDEO_FRAME_SIZE * 2 });
-    audioFifoWriter = fs.createWriteStream(AUDIO_FIFO, { highWaterMark: 44100 * 2 * 4 });
+    audioFifoWriter = fs.createWriteStream(AUDIO_FIFO, {
+      highWaterMark: audioInput.sampleRate * audioInput.channels * 4,
+    });
     videoFifoWriter.on("error", (e) => console.warn("[relay] video fifo error:", e.message));
     audioFifoWriter.on("error", (e) => console.warn("[relay] audio fifo error:", e.message));
-    ffmpegReady = true;
+
+    const markVideoOpen = () => {
+      videoWriterReady = true;
+      console.log("[relay] video FIFO writer ready");
+      resolveWriterReadyWaiters("video");
+      ffmpegReady = videoWriterReady && audioWriterReady;
+    };
+    const markAudioOpen = () => {
+      audioWriterReady = true;
+      ffmpegReady = videoWriterReady && audioWriterReady;
+      console.log("[relay] audio FIFO writer ready");
+      resolveWriterReadyWaiters("audio");
+    };
+    videoFifoWriter.once("open", markVideoOpen);
+    audioFifoWriter.once("open", markAudioOpen);
   });
 
   ffmpeg.stderr.on("data", (data) => {
@@ -221,18 +444,62 @@ function startFFmpeg() {
   ffmpeg.on("error", (err) => {
     console.error("[relay] FFmpeg process error:", err.message);
     ffmpegReady = false;
-    videoFifoWriter = null;
-    audioFifoWriter = null;
+    destroyFifoWriters();
   });
 
   ffmpeg.on("exit", (code, signal) => {
     console.log(`[relay] FFmpeg exited: code=${code} signal=${signal}`);
+    ffmpeg = null;
     ffmpegReady = false;
-    videoFifoWriter = null;
-    audioFifoWriter = null;
-    // Restart FFmpeg after a delay
-    setTimeout(startFFmpeg, 2000);
+    destroyFifoWriters();
+    // Restart FFmpeg after a delay, preserving the negotiated Chrome audio
+    // format. If Chrome reconnects with a different format before then,
+    // configureAudioInput() updates audioInput before the restart.
+    if (audioInput) {
+      ffmpegRestartTimer = setTimeout(startFFmpeg, 2000);
+    }
   });
+}
+
+function configureAudioInput(params) {
+  const next = {
+    sampleRate: params.sampleRate,
+    channels: params.channels,
+  };
+
+  if (!audioInput) {
+    audioInput = next;
+    console.log(`[relay] negotiated Chrome audio input: ${audioInputLabel(audioInput)}`);
+    startFFmpeg();
+    return Promise.resolve();
+  }
+
+  if (sameAudioInput(audioInput, next)) {
+    if (!ffmpeg && !ffmpegRestartTimer) {
+      startFFmpeg();
+    }
+    return Promise.resolve();
+  }
+
+  console.log(`[relay] Chrome audio input changed: ${audioInputLabel(audioInput)} → ${audioInputLabel(next)}; restarting FFmpeg`);
+  audioInput = next;
+  ffmpegReady = false;
+  destroyFifoWriters();
+
+  if (ffmpeg) {
+    try { ffmpeg.kill("SIGTERM"); } catch {}
+  } else {
+    startFFmpeg();
+  }
+
+  return Promise.resolve();
+}
+
+function waitForVideoInput() {
+  if (!audioInput) {
+    throw new Error("audio format has not been negotiated yet");
+  }
+  return waitForWriterReady("video");
 }
 
 // ---------------------------------------------------------------------------
@@ -340,11 +607,19 @@ function handleHTTPRequest(req, res) {
   }
 
   if (pathname === "/health") {
-    const healthy = ffmpegReady && videoIngestConnected && audioIngestConnected;
+    const healthy =
+      INGEST_MODE === "webm"
+        ? ffmpegReady && webmIngestConnected
+        : ffmpegReady && videoIngestConnected && audioIngestConnected;
     const body = JSON.stringify({
       status: healthy ? "healthy" : "unhealthy",
       ffmpeg: ffmpegReady,
-      ingest: { video: videoIngestConnected, audio: audioIngestConnected },
+      ingest:
+        INGEST_MODE === "webm"
+          ? { webm: webmIngestConnected }
+          : { video: videoIngestConnected, audio: audioIngestConnected },
+      ingestMode: INGEST_MODE,
+      audioInput: INGEST_MODE === "webm" ? null : audioInput,
       profile: PROFILE,
       output: OUTPUT,
     });
@@ -358,10 +633,10 @@ function handleHTTPRequest(req, res) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server + raw-frame ingest
+// HTTP server + ingest (WebM muxed or raw dual-socket)
 // ---------------------------------------------------------------------------
 
-function startServer() {
+function startRawFrameServer() {
   const httpServer = http.createServer(handleHTTPRequest);
 
   function fifoSink(getWriter) {
@@ -392,24 +667,54 @@ function startServer() {
       width: parseInt(WIDTH, 10),
       height: parseInt(HEIGHT, 10),
       framerate: parseFloat(FRAMERATE),
-      sampleRate: 44100,
-      channels: 2,
     },
+    onVideoParams: waitForVideoInput,
+    onAudioParams: configureAudioInput,
     onVideoConnect: (b) => { videoIngestConnected = b; },
     onAudioConnect: (b) => { audioIngestConnected = b; },
   });
 
   httpServer.listen(WS_PORT, () => {
-    console.log(`[relay] HTTP server listening on port ${WS_PORT}`);
+    console.log(`[relay] HTTP server listening on port ${WS_PORT} (ingest: raw I420+PCM)`);
     console.log(`[relay]   GET /guide.xml    — XMLTV programme guide`);
     console.log(`[relay]   GET /playlist.m3u — M3U playlist`);
     console.log(`[relay]   GET /health       — health check`);
   });
+
+  console.log("[relay] waiting for Chrome audio format before starting FFmpeg");
+}
+
+function startWebmServer() {
+  const httpServer = http.createServer(handleHTTPRequest);
+
+  mountIngestWebm(httpServer, {
+    streamSink: webmStdinSink(),
+    onStreamConnect: (connected) => {
+      webmIngestConnected = connected;
+    },
+    onBeforeUpgrade: prepareWebmIngest,
+    onNoActiveClients: killWebmFfmpegProcess,
+  });
+
+  httpServer.listen(WS_PORT, () => {
+    console.log(`[relay] HTTP server listening on port ${WS_PORT} (ingest: webm)`);
+    console.log(`[relay]   GET /guide.xml    — XMLTV programme guide`);
+    console.log(`[relay]   GET /playlist.m3u — M3U playlist`);
+    console.log(`[relay]   GET /health       — health check`);
+  });
+
+  console.log("[relay] waiting for WebM ingest on /ingest/webm");
 }
 
 // ---------------------------------------------------------------------------
 // Start everything
 // ---------------------------------------------------------------------------
 
-startFFmpeg();
-startServer();
+if (INGEST_MODE === "webm") {
+  startWebmServer();
+} else if (INGEST_MODE === "raw") {
+  startRawFrameServer();
+} else {
+  console.error(`[relay] Unknown INGEST_MODE="${INGEST_MODE}" (expected webm or raw)`);
+  process.exit(1);
+}
