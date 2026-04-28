@@ -5,6 +5,6 @@
   "description": "WebSocket-to-FFmpeg relay for tab capture streaming",
   "main": "server.js",
   "dependencies": {
-    "ws": "^8.16.0"
+    "ws": "^8.20.0"
   }
 }
