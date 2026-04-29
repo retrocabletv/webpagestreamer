@@ -21,7 +21,7 @@ test("video and audio WS messages are forwarded to their sinks in order", async 
 
   const httpServer = http.createServer();
   mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 4, height: 4, framerate: 25, sampleRate: 44100, channels: 2 } });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const vws = new WebSocket(`ws://127.0.0.1:${port}/ingest/video?w=4&h=4&fr=25`);
@@ -51,7 +51,7 @@ test("video WS connection is rejected on dimension mismatch", async () => {
   const a = collector();
   const httpServer = http.createServer();
   mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25, sampleRate: 44100, channels: 2 } });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const vws = new WebSocket(`ws://127.0.0.1:${port}/ingest/video?w=1280&h=720&fr=25`);
@@ -80,7 +80,7 @@ test("audio WS connection accepts Chrome-reported sample rate and channel count"
       audioParams = params;
     },
   });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const aws = new WebSocket(`ws://127.0.0.1:${port}/ingest/audio?sr=48000&ch=2`);
@@ -96,7 +96,7 @@ test("audio WS connection is rejected on invalid sample rate", async () => {
   const a = collector();
   const httpServer = http.createServer();
   mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25 } });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const aws = new WebSocket(`ws://127.0.0.1:${port}/ingest/audio?sr=0&ch=2`);
@@ -116,7 +116,7 @@ test("webm WS messages are forwarded to the stream sink in order", async () => {
     streamSink: c.sink,
     onBeforeUpgrade: async () => {},
   });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ingest/webm`);
@@ -138,7 +138,7 @@ test("unknown ingest pathname destroys the upgrade socket", async () => {
   const a = collector();
   const httpServer = http.createServer();
   mountIngest(httpServer, { videoSink: v.sink, audioSink: a.sink, expected: { width: 720, height: 576, framerate: 25, sampleRate: 44100, channels: 2 } });
-  await new Promise((r) => httpServer.listen(0, r));
+  await new Promise((r) => httpServer.listen(0, "127.0.0.1", r));
   const port = httpServer.address().port;
 
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ingest/bogus`);
