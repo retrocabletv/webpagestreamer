@@ -4,6 +4,9 @@
   "private": true,
   "description": "WebSocket-to-FFmpeg relay for tab capture streaming",
   "main": "server.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "ws": "^8.20.0"
   }
