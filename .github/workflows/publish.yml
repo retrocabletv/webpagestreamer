@@ -1,0 +1,165 @@
+name: publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag to rebuild and publish"
+        required: true
+        type: string
+      force_republish:
+        description: "Allow republishing a release that already has managed publish notes"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  publish:
+    concurrency:
+      group: publish-${{ github.event.release.tag_name || inputs.tag_name }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ inputs.tag_name }}"
+          else
+            TAG_NAME="${{ github.event.release.tag_name }}"
+          fi
+
+          if [ -z "$TAG_NAME" ]; then
+            echo "tag_name is required" >&2
+            exit 1
+          fi
+
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          IMAGE_VERSION="${TAG_NAME#v}"
+          echo "image_version=$IMAGE_VERSION" >> "$GITHUB_OUTPUT"
+          IFS='.' read -r IMAGE_MAJOR IMAGE_MINOR _ <<EOF
+          $IMAGE_VERSION
+          EOF
+          echo "image_major=$IMAGE_MAJOR" >> "$GITHUB_OUTPUT"
+          echo "image_minor=$IMAGE_MAJOR.$IMAGE_MINOR" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "release" ] && [ "${{ github.event.release.prerelease }}" = "false" ]; then
+            echo "publish_aliases=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish_aliases=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.tag.outputs.tag_name }}
+
+      - name: Guard manual republish
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.force_republish }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ steps.tag.outputs.tag_name }}"
+          RELEASE_JSON="$(gh release view "$TAG_NAME" --json body)"
+          HAS_MARKER="$(printf '%s' "$RELEASE_JSON" | jq -r '.body // "" | contains("<!-- webpagestreamer-publish:begin -->")')"
+
+          if [ "$HAS_MARKER" = "true" ]; then
+            echo "Release $TAG_NAME already appears to have been published by this workflow." >&2
+            echo "Re-run with force_republish=true if you intentionally want to replace managed notes." >&2
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.tag.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.tag.outputs.tag_name }},enable=${{ steps.tag.outputs.publish_aliases }}
+            type=semver,pattern={{major}},value=${{ steps.tag.outputs.tag_name }},enable=${{ steps.tag.outputs.publish_aliases }}
+            type=raw,value=latest,enable=${{ steps.tag.outputs.publish_aliases }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Append publish summary to release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE_VERSION: ${{ steps.tag.outputs.image_version }}
+          IMAGE_MAJOR_TAG: ${{ steps.tag.outputs.image_major }}
+          IMAGE_MINOR_TAG: ${{ steps.tag.outputs.image_minor }}
+          PUBLISH_ALIASES: ${{ steps.tag.outputs.publish_aliases }}
+        run: |
+          TAG_NAME="${{ steps.tag.outputs.tag_name }}"
+          gh release view "$TAG_NAME" --json body --jq '.body // ""' > /tmp/body.md
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("/tmp/body.md")
+          body = path.read_text()
+          begin = "<!-- webpagestreamer-publish:begin -->"
+          end = "<!-- webpagestreamer-publish:end -->"
+          image = f"{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_VERSION']}"
+          tags = [f"`{image}`"]
+          if os.environ["PUBLISH_ALIASES"] == "true":
+              tags.extend([
+                  f"`{os.environ['IMAGE_NAME']}:latest`",
+                  f"`{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_MINOR_TAG']}`",
+                  f"`{os.environ['IMAGE_NAME']}:{os.environ['IMAGE_MAJOR_TAG']}`",
+              ])
+          managed = "\n".join([
+              begin,
+              "**Published artifacts**",
+              "",
+              f"- Container image tags: {', '.join(tags)}",
+              "",
+              "_The image is built from the tagged Dockerfile and published to GHCR for amd64 and arm64._",
+              end,
+          ])
+          pattern = re.compile(r"<!-- webpagestreamer-publish:begin -->.*?<!-- webpagestreamer-publish:end -->", re.S)
+          if pattern.search(body):
+              updated = pattern.sub(managed, body, count=1)
+          else:
+              separator = "\n\n" if body.strip() else ""
+              updated = body.rstrip() + separator + managed + "\n"
+          path.write_text(updated)
+          PY
+
+          gh release edit "$TAG_NAME" --notes-file /tmp/body.md

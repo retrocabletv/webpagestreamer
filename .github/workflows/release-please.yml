@@ -11,13 +11,23 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v5
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
         with:
+          app-id: ${{ vars.CIBOT_APP_ID }}
+          private-key: ${{ secrets.CIBOT_PRIVATE_KEY }}
+
+      - name: Run release-please
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
