@@ -19,7 +19,7 @@ updates:
       prefix: "fix"
       include: scope
 
-  # Docker base image - alpine bumps = new chromium/ffmpeg/openssl, treat as fix.
+  # Docker base image - alpine bumps = new chromium/ffmpeg/openssl.
   - package-ecosystem: docker
     directory: /
     schedule:
@@ -28,14 +28,10 @@ updates:
     open-pull-requests-limit: 5
     groups:
       docker-dependencies:
-        applies-to: version-updates
         patterns:
           - "*"
-        update-types:
-          - minor
-          - patch
     commit-message:
-      prefix: "fix"
+      prefix: "build"
       include: scope
 
   # GitHub Actions - CI-only, no image impact, don't cut releases.
