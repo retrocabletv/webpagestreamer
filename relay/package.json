@@ -8,6 +8,6 @@
     "test": "node --test"
   },
   "dependencies": {
-    "ws": "^8.21.0"
+    "ws": "^8.21.1"
   }
 }
